@@ -121,6 +121,23 @@ Yes. Releases provide both `macos-x64.dmg` and `macos-arm64.dmg`. Intel Macs sho
 
 ## Development
 
+Windows builds require stable Rust (MSVC toolchain), Node.js, Visual Studio C++ build tools, and the Windows SDK.
+For a Windows ARM64 Rust toolchain, also install ARM64 MSVC tools and LLVM/Clang, and verify that `clang --version` works.
+The `ring` dependency requires Clang on Windows ARM64; MSVC alone results in `failed to find tool "clang"`.
+Install the C++ Clang tools through Visual Studio Installer, or obtain a toolchain for your host architecture from the [official LLVM releases](https://github.com/llvm/llvm-project/releases) and add its `bin` directory to PATH.
+Reopen the terminal after changing PATH, and preferably build from a Visual Studio Developer PowerShell/Command Prompt configured for the target architecture.
+
+To build both the launcher and manager from the repository root:
+
+```powershell
+Set-Location .\apps\codex-plus-manager
+npm ci
+npm run check
+npm run build
+```
+
+The default Windows outputs are `target\release\codex-plus-plus.exe` (launcher) and `target\release\codex-plus-plus-manager.exe` (manager).
+
 ```bash
 cd apps/codex-plus-manager
 npm ci

@@ -307,6 +307,24 @@ another-model[128000]
 
 前端位于 `apps/codex-plus-manager`，核心 Rust 库位于 `crates/codex-plus-core`，数据层位于 `crates/codex-plus-data`，界面注入脚本位于 `assets/inject`。
 
+Windows 构建需要 stable Rust（MSVC 工具链）、Node.js、Visual Studio 的 C++ 构建工具和 Windows SDK。
+使用 Windows ARM64 Rust 工具链时，还需要 ARM64 MSVC 工具和 LLVM/Clang，并确保 `clang --version` 可执行：
+依赖 `ring` 在 Windows ARM64 上必须使用 Clang，只有 MSVC 会报 `failed to find tool "clang"`。
+可通过 Visual Studio Installer 添加 C++ Clang 工具，或从 [LLVM 官方发布页](https://github.com/llvm/llvm-project/releases)安装适合本机架构的工具包并把其 `bin` 目录加入 PATH。
+修改 PATH 后重新打开终端；建议在对应架构的 Visual Studio Developer PowerShell/Command Prompt 中构建。
+
+完整构建启动器和管理器：
+
+```powershell
+# 在仓库根目录执行
+Set-Location .\apps\codex-plus-manager
+npm ci
+npm run check
+npm run build
+```
+
+默认产物位于仓库的 `target\release\codex-plus-plus.exe`（启动器）和 `target\release\codex-plus-plus-manager.exe`（管理器）。
+
 ```bash
 # 前端检查（先在 apps/codex-plus-manager 安装项目依赖）
 cd apps/codex-plus-manager
