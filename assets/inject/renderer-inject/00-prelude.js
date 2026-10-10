@@ -115,6 +115,7 @@
   const codexServiceTierBadgeClass = "codex-service-tier-badge";
   const codexServiceTierBadgeVersion = "3";
   let codexPlusVersion = window.__CODEX_PLUS_VERSION__ || "unknown";
+  const codexPlusInjectedPageTitle = "Codex UI 注入测试";
   const codexPlusBuild = window.__CODEX_PLUS_BUILD__ || "unknown";
   let lastSessionActionTrigger = null;
   const codexPlusSettingsKey = "codexPlusSettings";

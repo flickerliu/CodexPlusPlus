@@ -30,6 +30,18 @@ async function readStepwiseSource() {
   return `(() => {\n${fragments.join("\n")}\n})();\n`;
 }
 
+it("keeps the injection test page title on creation and backend refresh", async () => {
+  const source = await readFile(
+    new URL("../../../assets/inject/renderer-inject.js", import.meta.url),
+    "utf8",
+  );
+  assert.match(source, /const codexPlusInjectedPageTitle = "Codex UI 注入测试";/);
+  assert.ok(source.includes('data-codex-plus-version="true">${codexPlusInjectedPageTitle}</span>'));
+  assert.ok(source.includes('aria-label="${codexPlusInjectedPageTitle}"'));
+  assert.ok(source.includes("node.textContent = codexPlusInjectedPageTitle;"));
+  assert.ok(!source.includes("Codex++ ${codexPlusVersion}"));
+});
+
 it("only reveals floating-panel content after the shell has settled open", async () => {
   const source = await readFile(
     new URL("../../../assets/inject/floating-panel/core/appearance.js", import.meta.url),
