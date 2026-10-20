@@ -325,6 +325,13 @@ npm run build
 
 默认产物位于仓库的 `target\release\codex-plus-plus.exe`（启动器）和 `target\release\codex-plus-plus-manager.exe`（管理器）。
 
+在 Windows 上用 VS Code 打开仓库根目录，安装 Microsoft C/C++ 扩展（`ms-vscode.cpptools`），
+在 **Run and Debug** 中选择 **Debug Codex++ Launcher (Windows)**，按 **F5** 即可先构建 Debug 启动器再启动调试。
+配置位于 [launch.json](.vscode/launch.json)，构建任务位于 [tasks.json](.vscode/tasks.json)；无需先构建管理器前端。
+启动器沿用现有设置查找 Codex，调试前请先退出已有的 Codex++ 启动器实例，否则会走激活已有窗口的流程。
+如需指定 Codex 安装目录，可在调试配置的 `args` 中填写 `["--app-path", "C:\\path\\to\\Codex"]`。
+此配置调试的是 Rust 启动器，不会自动附加到 Codex 的 Electron 子进程。
+
 ```bash
 # 前端检查（先在 apps/codex-plus-manager 安装项目依赖）
 cd apps/codex-plus-manager

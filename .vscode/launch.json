@@ -1,0 +1,22 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Debug Codex++ Launcher (Windows)",
+      "type": "cppvsdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}\\target\\debug\\codex-plus-plus.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "stopAtEntry": false,
+      "console": "integratedTerminal",
+      "environment": [
+        {
+          "name": "RUST_BACKTRACE",
+          "value": "1"
+        }
+      ],
+      "preLaunchTask": "cargo: build launcher"
+    }
+  ]
+}
