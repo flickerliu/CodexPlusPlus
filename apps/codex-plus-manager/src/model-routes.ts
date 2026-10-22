@@ -14,6 +14,8 @@ export type RelayModelRouteProfile = {
   officialMixApiKey: boolean;
   noAuth?: boolean;
   modelRoutes?: RelayModelRoute[];
+  customHeaders?: { key: string; value: string }[];
+  responsesToolSchemaCompat?: boolean;
 };
 
 export type RelayModelRouteSettings = {
@@ -71,18 +73,26 @@ export function findRelayModelRouteIssue(
   return null;
 }
 
+export function relayProfileRequiresProtocolProxy(
+  profile: Pick<RelayModelRouteProfile, "relayMode" | "protocol" | "noAuth" | "modelRoutes" | "customHeaders" | "responsesToolSchemaCompat">,
+): boolean {
+  return profile.relayMode === "aggregate"
+    || profile.protocol === "chatCompletions"
+    || (profile.relayMode === "pureApi" && profile.noAuth === true)
+    || (profile.customHeaders || []).some((header) => header.key.trim().length > 0)
+    || (profile.protocol === "responses" && profile.responsesToolSchemaCompat === true)
+    || normalizeRelayModelRoutes(profile.modelRoutes).some(
+      (route) => Boolean(route.model.trim() && route.targetRelayId.trim()),
+    );
+}
+
 export function settingsRequireLocalHelper(settings: RelayModelRouteSettings): boolean {
   if (settings.enhancementsEnabled) return true;
   const active = settings.relayProfiles.find((profile) => profile.id === settings.activeRelayId)
     ?? settings.relayProfiles[0];
   if (!active) return false;
-  return active.relayMode === "aggregate"
-    || active.protocol === "chatCompletions"
-    || (active.relayMode === "pureApi" && active.noAuth === true)
-    || (active.relayMode === "official" && active.officialMixApiKey)
-    || normalizeRelayModelRoutes(active.modelRoutes).some(
-      (route) => Boolean(route.model.trim() && route.targetRelayId.trim()),
-    );
+  return relayProfileRequiresProtocolProxy(active)
+    || (active.relayMode === "official" && active.officialMixApiKey);
 }
 
 export function modelRouteSaveRequiresRestart(

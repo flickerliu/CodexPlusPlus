@@ -4378,6 +4378,151 @@ fn session_header_settings(protocol: RelayProtocol, base_url: String) -> Backend
 }
 
 #[tokio::test]
+async fn responses_schema_compat_preserves_namespaces_headers_and_streams() {
+    let request = json!({
+        "model": "session-probe", "input": "hello", "stream": true,
+        "tools": [
+            {"type": "web_search"},
+            {
+                "type": "namespace", "name": "automations", "description": "unchanged namespace",
+                "tools": [{
+                    "type": "function", "name": "automation_update", "strict": false,
+                    "description": "unchanged tool",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"base": {"type": "string"}},
+                        "required": ["base"],
+                        "oneOf": [
+                            {"$ref": "#/$defs/update"},
+                            {"$ref": "#/$defs/remove"}
+                        ],
+                        "$defs": {
+                            "update": {
+                                "type": "object",
+                                "allOf": [{"$ref": "#/$defs/extra"}],
+                                "properties": {
+                                    "mode": {"type": "string", "const": "update"},
+                                    "note": {"type": "string"}
+                                },
+                                "required": ["mode", "note"]
+                            },
+                            "remove": {
+                                "type": "object",
+                                "properties": {
+                                    "mode": {"type": "string", "const": "remove"},
+                                    "targetThreadId": {"type": "string"}
+                                },
+                                "required": ["mode", "targetThreadId"]
+                            },
+                            "extra": {"properties": {"extra": {"type": "boolean"}}}
+                        }
+                    }
+                }]
+            },
+            {
+                "type": "function", "name": "all_fields",
+                "parameters": {
+                    "type": null,
+                    "allOf": [
+                        {"properties": {"a": {"type": "string"}}, "required": ["a"]},
+                        {"properties": {"b": {"type": "string"}}, "required": ["b"]}
+                    ],
+                    "anyOf": [
+                        {"properties": {"c": {"type": "string"}}, "required": ["c"]},
+                        {"properties": {"d": {"type": "number"}}}
+                    ]
+                }
+            }
+        ]
+    });
+    let sse = "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"name\":\"automation_update\",\"namespace\":\"automations\",\"call_id\":\"call_1\",\"arguments\":\"{}\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compat\"}}\n\n";
+    for enabled in [false, true] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(capture_request_with_response(listener, "text/event-stream", sse.to_string()));
+        let mut settings = session_header_settings(RelayProtocol::Responses, format!("http://{address}/v1"));
+        let relay = &mut settings.relay_profiles[0];
+        relay.responses_tool_schema_compat = enabled;
+        relay.custom_headers = vec![
+            codex_plus_core::settings::RelayHeaderKeyValue {
+                key: "Ocp-Apim-Subscription-Key".to_string(), value: "fixture-subscription".to_string(),
+            },
+            codex_plus_core::settings::RelayHeaderKeyValue {
+                key: "Authorization".to_string(), value: "Custom fixture-auth".to_string(),
+            },
+        ];
+        let result = open_responses_proxy_request_with_settings(&request.to_string(), settings).await.unwrap();
+        assert_eq!(result.status_code, 200);
+        assert!(result.is_stream);
+        assert_eq!(result.response.text().await.unwrap(), sse);
+        let (headers, body) = server.await.unwrap();
+        assert!(headers.starts_with("POST /v1/responses HTTP/1.1"));
+        assert_eq!(captured_header_values(&headers, "Ocp-Apim-Subscription-Key"), vec!["fixture-subscription"]);
+        assert_eq!(captured_header_values(&headers, "Authorization"), vec!["Custom fixture-auth"]);
+        assert_eq!(body["model"], request["model"]);
+        assert_eq!(body["stream"], true);
+        if !enabled {
+            assert_eq!(body["tools"], request["tools"]);
+            continue;
+        }
+        assert_eq!(body["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(body["tools"][0], request["tools"][0]);
+        let namespace = &body["tools"][1];
+        assert_eq!(namespace["name"], "automations");
+        assert_eq!(namespace["description"], "unchanged namespace");
+        let tool = &namespace["tools"][0];
+        assert_eq!(tool["name"], "automation_update");
+        assert_eq!(tool["description"], "unchanged tool");
+        assert_eq!(tool["strict"], false);
+        let schema = &tool["parameters"];
+        assert_eq!(schema["type"], "object");
+        assert!(schema.get("oneOf").is_none());
+        assert_eq!(schema["required"], json!(["base", "mode"]));
+        for name in ["base", "mode", "note", "targetThreadId", "extra"] {
+            assert!(schema["properties"].get(name).is_some(), "missing {name}");
+        }
+        assert_eq!(schema["properties"]["mode"]["anyOf"][0]["const"], "update");
+        assert_eq!(schema["properties"]["mode"]["anyOf"][1]["const"], "remove");
+        let schema = &body["tools"][2]["parameters"];
+        assert_eq!(schema["type"], "object");
+        assert!(schema.get("allOf").is_none());
+        assert!(schema.get("anyOf").is_none());
+        assert_eq!(schema["required"], json!(["a", "b"]));
+        assert_eq!(schema["properties"]["d"]["type"], "number");
+    }
+}
+
+#[tokio::test]
+async fn responses_schema_compat_rejects_unsupported_constraints_without_sending_empty_schemas() {
+    for parameters in [
+        json!({"enum": [{"a": 1}]}),
+        json!({"const": {"a": 1}}),
+        json!({"not": {"required": ["a"]}}),
+        json!({"$ref": "#/$defs/missing"}),
+        json!({"oneOf": [{"type": "string"}, {"type": "object"}]}),
+        json!({"oneOf": []}),
+        json!({
+            "oneOf": [{"$ref": "#/$defs/loop"}],
+            "$defs": {"loop": {"oneOf": [{"$ref": "#/$defs/loop"}]}}
+        }),
+    ] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut settings = session_header_settings(RelayProtocol::Responses, format!("http://{address}/v1"));
+        settings.relay_profiles[0].responses_tool_schema_compat = true;
+        let request = json!({
+            "model": "session-probe", "input": "hi",
+            "tools": [{"type": "function", "name": "automation_update", "parameters": parameters}]
+        });
+        match open_responses_proxy_request_with_settings(&request.to_string(), settings).await {
+            Ok(_) => panic!("unsupported schema must fail explicitly"),
+            Err(error) => assert!(format!("{error:#}").contains("automation_update"), "{error:#}"),
+        }
+        assert!(tokio::time::timeout(Duration::from_millis(20), listener.accept()).await.is_err());
+    }
+}
+
+#[tokio::test]
 async fn responses_proxy_preserves_session_headers_through_both_protocols() {
     for protocol in [RelayProtocol::Responses, RelayProtocol::ChatCompletions] {
         // 连续两次请求携带不同的客户端会话，不能混成供应商级固定值。

@@ -316,9 +316,10 @@ pub fn ensure_active_protocol_proxy_config_in_home(
                 .with_context(|| format!("读取 {} 失败", config_path.display()));
         }
     };
-    let mut doc = parse_toml_document(&existing)?;
+    let cleaned = strip_native_relay_headers_from_backfill(&profile, &existing, &profile.config_contents)?;
+    let mut doc = parse_toml_document(&cleaned)?;
     let managed = managed_openai_base_url();
-    let mut changed = false;
+    let mut changed = cleaned != existing;
     let session_provider_id = active_session_provider_id(&doc);
     let transport_provider_id = if session_provider_id == "openai" {
         RELAY_PROVIDER.to_string()
@@ -560,7 +561,6 @@ pub fn apply_relay_profile_files_to_home_with_context(
             apply_model_catalog_to_config(home, profile, &config_with_limits)?;
         let compatible_config =
             apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
-        let compatible_config = apply_native_relay_headers_to_config(profile, &compatible_config)?;
         // 聚合 profile 的快照里没有凭据，必须现生成一份含代理 token 的合法 JSON，
         // 否则会把 auth.json 写成空文件（issue #1604）。
         let auth_contents = if profile.relay_mode == crate::settings::RelayMode::Aggregate {
@@ -725,7 +725,6 @@ pub fn apply_relay_profile_to_home_with_switch_rules(
             apply_model_catalog_to_config(home, profile, &config_with_limits)?;
         let compatible_config =
             apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
-        let compatible_config = apply_native_relay_headers_to_config(profile, &compatible_config)?;
 
         if profile.relay_mode == crate::settings::RelayMode::PureApi {
             // 与 Aggregate / Official 分支对称：先读 live auth.json 再合并，
@@ -775,7 +774,6 @@ pub fn apply_relay_profile_config_to_home_with_context(
             apply_model_catalog_to_config(home, profile, &config_with_limits)?;
         let compatible_config =
             apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
-        let compatible_config = apply_native_relay_headers_to_config(profile, &compatible_config)?;
         apply_relay_config_file_to_home(home, &compatible_config)
     })
 }
@@ -1348,10 +1346,7 @@ fn recognized_managed_proxy_endpoint(profile: &RelayProfile, config: &str) -> bo
     if normalize_relay_endpoint(&live) == normalize_relay_endpoint(&managed_openai_base_url()) {
         return true;
     }
-    let proxy_mode = profile.protocol == RelayProtocol::ChatCompletions
-        || profile.has_model_routes()
-        || profile.uses_no_auth()
-        || profile.relay_mode == RelayMode::Aggregate;
+    let proxy_mode = profile.uses_protocol_proxy();
     let saved_endpoint_matches = provider_string_from_config(&profile.config_contents, "base_url")
         .is_some_and(|saved| {
             is_loopback_responses_endpoint(&saved)
@@ -4306,7 +4301,11 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
             crate::protocol_proxy::protocol_proxy_port(),
         );
     }
-    if profile.has_model_routes() || profile.uses_no_auth() {
+    if profile.has_model_routes()
+        || profile.uses_no_auth()
+        || !profile.custom_headers.is_empty()
+        || profile.responses_tool_schema_compat
+    {
         if !profile.upstream_base_url.trim().is_empty() {
             return profile.upstream_base_url.trim().to_string();
         }
@@ -4335,7 +4334,12 @@ pub fn relay_profile_base_url(profile: &RelayProfile) -> String {
     let provider_base_url = provider_string_from_config(&profile.config_contents, "base_url")
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_default();
-    if profile.protocol == RelayProtocol::ChatCompletions
+    if is_loopback_responses_endpoint(&provider_base_url)
+        && !profile.upstream_base_url.trim().is_empty()
+        && !is_loopback_responses_endpoint(&profile.upstream_base_url)
+    {
+        profile.upstream_base_url.trim().to_string()
+    } else if profile.protocol == RelayProtocol::ChatCompletions
         && provider_base_url
             == crate::protocol_proxy::local_responses_proxy_base_url(
                 crate::protocol_proxy::protocol_proxy_port(),
@@ -4378,67 +4382,13 @@ fn native_relay_headers_provider_id(
     profile: &RelayProfile,
     doc: &DocumentMut,
 ) -> Option<String> {
-    if profile.protocol != RelayProtocol::Responses
-        || profile.has_model_routes()
-        || profile.uses_no_auth()
-        || profile.relay_mode == RelayMode::Aggregate
-        || (profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key)
+    if (profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key)
         || active_session_provider_id(doc) == "openai"
         || !profile.custom_headers.iter().any(|header| !header.key.trim().is_empty())
     {
         return None;
     }
     Some(active_or_default_provider_id(doc))
-}
-
-fn apply_native_relay_headers_to_config(
-    profile: &RelayProfile,
-    config: &str,
-) -> anyhow::Result<String> {
-    let mut doc = parse_toml_document(config)?;
-    let Some(provider_id) = native_relay_headers_provider_id(profile, &doc) else {
-        return Ok(config.to_string());
-    };
-    crate::relay_headers::validate(&profile.custom_headers)?;
-    let provider = ensure_provider_table(&mut doc, &provider_id)?;
-    for field in ["http_headers", "env_http_headers"] {
-        if field == "http_headers" && !provider.contains_key(field) {
-            provider[field] = toml_edit::value(toml_edit::InlineTable::new());
-        }
-        let Some(item) = provider.get_mut(field) else {
-            continue;
-        };
-        let table = item.as_table_like_mut().ok_or_else(|| {
-            anyhow::anyhow!("供应商配置 model_providers.{provider_id}.{field} 必须是请求头表")
-        })?;
-        let conflicts: Vec<String> = table
-            .iter()
-            .filter(|(key, _)| profile.custom_headers.iter().any(|header| {
-                key.eq_ignore_ascii_case(header.key.trim())
-            }))
-            .map(|(key, _)| key.to_string())
-            .collect();
-        for key in conflicts {
-            table.remove(&key);
-        }
-        if field == "http_headers" {
-            for header in &profile.custom_headers {
-                if !header.key.trim().is_empty() {
-                    table.insert(header.key.trim(), toml_edit::value(header.value.as_str()));
-                }
-            }
-        }
-        if table.is_empty() {
-            provider.remove(field);
-        }
-    }
-    if crate::relay_headers::has_authorization(&profile.custom_headers) {
-        for field in ["experimental_bearer_token", "env_key", "auth"] {
-            provider.remove(field);
-        }
-        provider["requires_openai_auth"] = toml_edit::value(false);
-    }
-    Ok(ensure_trailing_newline(doc.to_string()))
 }
 
 fn strip_native_relay_headers_from_backfill(
@@ -4457,7 +4407,7 @@ fn strip_native_relay_headers_from_backfill(
         .and_then(|providers| providers.get(&provider_id))
         .and_then(Item::as_table);
     let provider = ensure_provider_table(&mut doc, &provider_id)?;
-    // 自定义头只投影到运行配置；回填时还原模板，避免删除 UI 配置后旧密钥残留。
+    // 迁移旧版原生头投影：仅移除与 UI 配置一致的生成项，并保留模板里的手写头。
     for field in ["http_headers", "env_http_headers"] {
         let original = template_provider.and_then(|provider| provider.get(field));
         if !provider.contains_key(field) && original.is_some() {
@@ -4508,6 +4458,7 @@ fn strip_native_relay_headers_from_backfill(
 }
 
 fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<String> {
+    crate::relay_headers::validate(&profile.custom_headers)?;
     let mut doc = parse_toml_document(&profile.config_contents)?;
     let session_provider_id = active_session_provider_id(&doc);
     let uses_openai_provider = session_provider_id == "openai";
@@ -4609,7 +4560,7 @@ fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<Strin
     if profile.relay_mode == crate::settings::RelayMode::Aggregate {
         provider["requires_openai_auth"] = toml_edit::value(false);
     }
-    let provider_base_url = if profile.has_model_routes() || profile.uses_no_auth() {
+    let provider_base_url = if profile.uses_protocol_proxy() {
         crate::protocol_proxy::local_responses_proxy_base_url(
             crate::protocol_proxy::protocol_proxy_port(),
         )

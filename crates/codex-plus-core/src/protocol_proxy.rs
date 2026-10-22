@@ -2062,6 +2062,12 @@ async fn upstream_request_parts(
     };
     if relay.protocol == RelayProtocol::Responses {
         normalize_responses_item_ids(&mut body);
+        if relay.responses_tool_schema_compat {
+            if let Some(tools) = body.get_mut("tools") {
+                let tools = tools.as_array_mut().context("Responses tools 必须是数组")?;
+                normalize_responses_tool_schemas(tools)?;
+            }
+        }
     }
 
     // Image handling (per-model): send-as-is / strip / VLM analysis
@@ -4692,6 +4698,129 @@ fn namespace_tool_to_chat_tools(namespace_tool: &Value, context: &CodexToolConte
         }));
     }
     converted
+}
+
+fn normalize_responses_tool_schemas(tools: &mut [Value]) -> anyhow::Result<()> {
+    for tool in tools {
+        let name = tool.get("name").and_then(Value::as_str).unwrap_or("<unnamed>").to_string();
+        match tool.get("type").and_then(Value::as_str) {
+            Some("namespace") => {
+                let children = tool.get_mut("tools").and_then(Value::as_array_mut)
+                    .with_context(|| format!("Responses namespace {name} 的 tools 必须是数组"))?;
+                normalize_responses_tool_schemas(children)?;
+            }
+            Some("function") => {
+                let parameters = tool.get("parameters").cloned().unwrap_or_else(|| json!({}));
+                let normalized = normalize_responses_tool_parameters(&parameters)
+                    .with_context(|| format!("Responses 工具 {name} 的 Schema 无法兼容"))?;
+                if normalized != parameters {
+                    tool["parameters"] = normalized;
+                    let _ = crate::diagnostic_log::append_diagnostic_log(
+                        "protocol_proxy.responses_tool_schema_compat",
+                        json!({ "tool": name, "reason": "top_level_object_schema" }),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn normalize_responses_tool_parameters(parameters: &Value) -> anyhow::Result<Value> {
+    normalize_responses_tool_parameters_with_defs(parameters, None, &mut Vec::new())
+}
+
+fn normalize_responses_tool_parameters_with_defs(
+    parameters: &Value,
+    inherited_defs: Option<&Map<String, Value>>,
+    resolving: &mut Vec<String>,
+) -> anyhow::Result<Value> {
+    let defs = parameters.get("$defs").and_then(Value::as_object).or(inherited_defs);
+    if let Some(name) = bare_local_ref_name(parameters) {
+        let resolved = resolve_local_definition(name, defs, resolving)
+            .map_err(|_| anyhow::anyhow!("工具参数包含循环引用"))?
+            .context("工具参数引用的定义不存在")?;
+        resolving.push(name.to_string());
+        let result = normalize_responses_tool_parameters_with_defs(&resolved, defs, resolving);
+        resolving.pop();
+        return result;
+    }
+    let resolved = normalize_schema_value(parameters, defs, resolving)
+        .map_err(|_| anyhow::anyhow!("工具参数包含循环引用"))?;
+    let mut object = resolved.as_object().context("工具参数 Schema 必须是对象")?.clone();
+    for key in ["enum", "const", "not", "$ref"] {
+        if object.contains_key(key) {
+            anyhow::bail!("不支持合并工具参数顶层的 {key}，请在上游修复 Schema");
+        }
+    }
+    if object.get("type").is_some_and(|value| !value.is_null() && value != "object") {
+        anyhow::bail!("工具参数顶层 type 必须是 object");
+    }
+    let mut properties = match object.remove("properties") {
+        Some(Value::Object(properties)) => properties,
+        None => Map::new(),
+        _ => anyhow::bail!("工具参数 properties 必须是对象"),
+    };
+    let mut required = schema_required_fields(object.remove("required"))?;
+    for key in SCHEMA_COMBINATOR_KEYS {
+        let Some(branches) = object.remove(key) else { continue };
+        let branches = branches.as_array().filter(|branches| !branches.is_empty())
+            .with_context(|| format!("工具参数 {key} 必须是非空数组"))?;
+        let mut branch_properties = Map::new();
+        let mut branch_required: Option<BTreeSet<String>> = None;
+        for branch in branches {
+            let branch = normalize_responses_tool_parameters_with_defs(branch, defs, resolving)?;
+            let fields = branch["properties"].as_object().context("组合分支 properties 必须是对象")?;
+            for (name, value) in fields {
+                merge_responses_schema_property(
+                    &mut branch_properties, name, value,
+                    if key == "allOf" { "allOf" } else { "anyOf" },
+                );
+            }
+            let fields = schema_required_fields(branch.get("required").cloned())?;
+            branch_required = Some(match branch_required {
+                Some(previous) if key == "allOf" => previous.union(&fields).cloned().collect(),
+                Some(previous) => previous.intersection(&fields).cloned().collect(),
+                None => fields,
+            });
+        }
+        // 基础属性约束与分支约束取交集；分支间的同名属性保留所有候选，不能只取第一个。
+        for (name, value) in branch_properties {
+            merge_responses_schema_property(&mut properties, &name, &value, "allOf");
+        }
+        required.extend(branch_required.unwrap_or_default());
+    }
+    object.insert("type".to_string(), json!("object"));
+    object.insert("properties".to_string(), Value::Object(properties));
+    object.insert("required".to_string(), json!(required.into_iter().collect::<Vec<_>>()));
+    Ok(Value::Object(object))
+}
+
+fn schema_required_fields(value: Option<Value>) -> anyhow::Result<BTreeSet<String>> {
+    match value {
+        None => Ok(BTreeSet::new()),
+        Some(Value::Array(fields)) => fields.into_iter().map(|field| {
+            field.as_str().map(str::to_string).context("工具参数 required 只能包含字段名")
+        }).collect(),
+        _ => anyhow::bail!("工具参数 required 必须是数组"),
+    }
+}
+
+fn merge_responses_schema_property(
+    properties: &mut Map<String, Value>,
+    name: &str,
+    value: &Value,
+    operator: &str,
+) {
+    match properties.get_mut(name) {
+        Some(existing) if existing != value => {
+            let previous = existing.take();
+            *existing = json!({ (operator): [previous, value] });
+        }
+        Some(_) => {}
+        None => { properties.insert(name.to_string(), value.clone()); }
+    }
 }
 
 fn normalize_chat_tool_parameters(parameters: &Value) -> Value {

@@ -51,6 +51,24 @@ test("model route inputs keep focus while editing and label the example placehol
   );
 });
 
+test("custom headers and schema compatibility require a helper even with enhancements off", () => {
+  const direct = settings([profile("source")]);
+  assert.equal(settingsRequireLocalHelper(direct), false);
+  assert.equal(settingsRequireLocalHelper(settings([profile("source", {
+    customHeaders: [{ key: "  ", value: "" }],
+  })])), false);
+  for (const patch of [
+    { customHeaders: [{ key: "X-Empty-Value", value: "" }] },
+    { responsesToolSchemaCompat: true },
+  ]) {
+    const proxied = settings([profile("source", patch)]);
+    assert.equal(settingsRequireLocalHelper(proxied), true);
+    assert.equal(modelRouteSaveRequiresRestart(direct, proxied, "https://source.example/v1"), true);
+    assert.equal(modelRouteSaveRequiresRestart(proxied, proxied, "https://source.example/v1"), true);
+    assert.equal(modelRouteSaveRequiresRestart(proxied, proxied, PROTOCOL_PROXY_BASE_URL), false);
+  }
+});
+
 test("saving a route target validates every reverse reference against the proposed settings", () => {
   const source = profile("source", {
     modelRoutes: [{ model: "gpt-5.6-luna", targetRelayId: "target", targetModel: "" }],

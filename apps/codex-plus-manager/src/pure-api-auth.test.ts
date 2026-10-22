@@ -4,7 +4,7 @@ import { test } from "node:test";
 import vm from "node:vm";
 import ts from "typescript";
 import { modelSlugFromRowName, suffixWindowString } from "./model-metadata.ts";
-import { normalizeRelayModelRoutes } from "./model-routes.ts";
+import { normalizeRelayModelRoutes, relayProfileRequiresProtocolProxy } from "./model-routes.ts";
 import { sessionProviderForProtocol } from "./relay-session.ts";
 
 // 执行 App 中实际使用的配置 helper，避免把另一份实现复制进测试。
@@ -36,7 +36,7 @@ const context = vm.createContext({
   exports: {},
   PROTOCOL_PROXY_BASE_URL: "http://127.0.0.1:57321/v1",
   CHAT_UPSTREAM_BASE_URL_KEY: "codex_plus_chat_base_url",
-  normalizeRelayModelRoutes, sessionProviderForProtocol, modelSlugFromRowName, suffixWindowString,
+  normalizeRelayModelRoutes, relayProfileRequiresProtocolProxy, sessionProviderForProtocol, modelSlugFromRowName, suffixWindowString,
 });
 vm.runInContext(code, context);
 
@@ -96,15 +96,24 @@ test("inline imports and backfilled auth snapshots keep explicit provider creden
   assert.equal(JSON.parse(backfilled.authContents).vendor, "stored");
 });
 
-test("protocol and model-route edits retain explicit auth for local transport", () => {
+test("proxy feature edits retain explicit auth and real upstream for local transport", () => {
   for (const patch of [
     { protocol: "chatCompletions" },
     { modelRoutes: [{ model: "fixture-model", targetRelayId: "other", targetModel: "upstream" }] },
+    { customHeaders: [{ key: "Ocp-Apim-Subscription-Key", value: "fixture-subscription" }] },
+    { responsesToolSchemaCompat: true },
   ]) {
     const updated = context.applyRelayProfilePatchToFiles(profile(false), patch);
     assert.match(updated.configContents, /base_url = "http:\/\/127\.0\.0\.1:57321\/v1"/);
     assert.match(updated.configContents, /experimental_bearer_token = "fixture-provider-key"/);
     assert.match(updated.configContents, /requires_openai_auth = false/);
+    assert.equal(updated.baseUrl, "https://relay.example/v1");
+    assert.equal(updated.upstreamBaseUrl, "https://relay.example/v1");
+    assert.doesNotMatch(updated.configContents, /fixture-subscription/);
+    const restored = context.applyRelayProfilePatchToFiles(updated, {
+      protocol: "responses", modelRoutes: [], customHeaders: [], responsesToolSchemaCompat: false,
+    });
+    assert.match(restored.configContents, /base_url = "https:\/\/relay.example\/v1"/);
   }
 });
 

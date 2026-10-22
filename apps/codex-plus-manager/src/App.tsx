@@ -134,6 +134,7 @@ import {
   findRelayModelRouteIssue,
   modelRouteSaveRequiresRestart,
   normalizeRelayModelRoutes,
+  relayProfileRequiresProtocolProxy,
   PROTOCOL_PROXY_BASE_URL,
   type RelayModelRoute,
 } from "./model-routes";
@@ -386,6 +387,7 @@ export type RelayProfile = {
   noAuth: boolean;
   modelRoutes?: RelayModelRoute[];
   standardOpenaiProtocol: boolean;
+  responsesToolSchemaCompat?: boolean;
   rateLimitCooldownEnabled: boolean;
   channelQueueEnabled: boolean;
   channelRequestsPerMinute: number;
@@ -7571,7 +7573,7 @@ function RelayProfileDetail({
         next,
         activeLiveBaseUrl,
       );
-      if (requiresRestart && !window.confirm(t("首次启用单模型路由需要启动本地协议代理。保存后将立即重启 Codex，使路由安全生效。是否继续？"))) {
+      if (requiresRestart && !window.confirm(t("当前配置需要本地协议代理。保存后将立即重启 Codex，使请求头、兼容设置与路由安全生效。是否继续？"))) {
         return;
       }
       const savedSettings = await onFormChange(next);
@@ -8941,6 +8943,20 @@ function RelayProfileEditor({
                 <ToggleVisual />
               </label>
             ) : null}
+            {showApiFields && profile.protocol === "responses" ? (
+              <label className="switch-row compact relay-switch-row">
+                <input
+                  checked={profile.responsesToolSchemaCompat === true}
+                  onChange={(event) => updateDraft({ responsesToolSchemaCompat: event.currentTarget.checked })}
+                  type="checkbox"
+                />
+                <span>
+                  <strong>{t("Responses 工具 Schema 兼容")}</strong>
+                  <small>{t("通过本地代理合并工具参数顶层的 oneOf / anyOf / allOf，保留工具名与参数字段，但会放宽分支约束。仅在上游拒绝这些 Schema 时启用；无法安全合并时会明确报错。")}</small>
+                </span>
+                <ToggleVisual />
+              </label>
+            ) : null}
             {showApiFields ? (
               <Field className="relay-field-user-agent" label="User-Agent">
                 <Input
@@ -9006,7 +9022,7 @@ function RelayProfileEditor({
                     </Button>
                   </div>
                   <span className="hint-line">
-                    {t("自定义请求头会同时用于测试连接、模型列表与实际对话。Responses 直连会写入 Codex 原生 http_headers；需要协议代理时由代理添加。")}
+                    {t("自定义请求头会同时用于测试连接、模型列表与实际对话。配置后通过现有本地协议代理统一添加，请从 Codex++ 启动。")}
                   </span>
                   <span className="hint-line">
                     {t("Host、Content-Length 等传输头由协议层掌控，不能覆盖；配置 Authorization 时以它为准，不再注入 API Key。")}
@@ -12115,6 +12131,7 @@ function normalizeRelayProfile(profile: RelayProfile, defaultContextSelection = 
     sub2apiEnabled: profile.noAuth ? false : profile.sub2apiEnabled === true,
     sub2apiMultiplier: !profile.noAuth && profile.sub2apiEnabled === true ? profile.sub2apiMultiplier || "" : "",
     standardOpenaiProtocol: profile.standardOpenaiProtocol === true,
+    responsesToolSchemaCompat: profile.responsesToolSchemaCompat === true,
     rateLimitCooldownEnabled: profile.rateLimitCooldownEnabled === true,
     channelQueueEnabled: profile.channelQueueEnabled === true,
     channelRequestsPerMinute: clampNumber(profile.channelRequestsPerMinute ?? 20, 1, 10000),
@@ -12310,10 +12327,10 @@ function withGeneratedRelayFiles(profile: RelayProfile): RelayProfile {
 }
 
 function buildRelayConfigToml(
-  profile: Pick<RelayProfile, "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider">,
+  profile: Pick<RelayProfile, "model" | "baseUrl" | "upstreamBaseUrl" | "apiKey" | "protocol" | "sessionProvider" | "relayMode" | "noAuth" | "modelRoutes" | "customHeaders" | "responsesToolSchemaCompat">,
   options: { includeBearerToken: boolean; requiresOpenAiAuth?: boolean },
 ): string {
-  const baseUrl = profile.protocol === "chatCompletions" ? PROTOCOL_PROXY_BASE_URL : profile.baseUrl.trim();
+  const baseUrl = relayProfileRequiresProtocolProxy(profile) ? PROTOCOL_PROXY_BASE_URL : profile.baseUrl.trim();
   const apiKey = profile.apiKey.trim();
   const sessionProvider = normalizeRelaySessionProvider(profile.sessionProvider);
   const rootLines = [
@@ -12445,8 +12462,8 @@ function applyRelayProfilePatchToFiles(
   if ("upstreamBaseUrl" in patch) {
     next.baseUrl = patch.upstreamBaseUrl || "";
   }
-  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch) {
-    const baseUrlForConfig = next.protocol === "chatCompletions" || normalizeRelayModelRoutes(next.modelRoutes).length > 0
+  if ("baseUrl" in patch || "upstreamBaseUrl" in patch || "protocol" in patch || "modelRoutes" in patch || "customHeaders" in patch || "responsesToolSchemaCompat" in patch) {
+    const baseUrlForConfig = relayProfileRequiresProtocolProxy(next)
       ? PROTOCOL_PROXY_BASE_URL
       : next.upstreamBaseUrl || next.baseUrl;
     next.configContents = setCodexProviderStringKey(next.configContents, "base_url", baseUrlForConfig, {

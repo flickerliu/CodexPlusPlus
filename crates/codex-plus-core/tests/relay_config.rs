@@ -203,14 +203,15 @@ env_http_headers = { "X-Feature" = "GATEWAY_FEATURE" }
 }
 
 #[test]
-fn native_headers_are_written_by_every_profile_apply_entrypoint_without_proxy() {
+fn custom_headers_use_proxy_in_every_profile_apply_entrypoint() {
     let profile = native_headers_profile();
     let settings = BackendSettings {
         enhancements_enabled: false,
+        active_relay_id: profile.id.clone(),
         relay_profiles: vec![profile.clone()],
         ..BackendSettings::default()
     };
-    assert!(!settings.active_relay_uses_protocol_proxy());
+    assert!(settings.active_relay_uses_protocol_proxy());
     assert!(!profile.config_contents.contains("test-subscription"));
 
     for entrypoint in 0..3 {
@@ -223,18 +224,18 @@ fn native_headers_are_written_by_every_profile_apply_entrypoint_without_proxy() 
         let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
         let doc = live.parse::<toml_edit::DocumentMut>().unwrap();
         let provider = &doc["model_providers"]["gateway"];
-        assert_eq!(provider["base_url"].as_str(), Some("https://gateway.example.test/turnstile/llm"));
-        assert_eq!(provider["http_headers"]["Ocp-Apim-Subscription-Key"].as_str(), Some("test-subscription"));
-        assert_eq!(provider["http_headers"]["x-project-id"].as_str(), Some("test-project"));
+        assert_eq!(provider["base_url"].as_str(), Some("http://127.0.0.1:57321/v1"));
+        assert!(!live.contains("test-subscription"));
+        assert!(!live.contains("x-project-id"));
         assert_eq!(provider["http_headers"]["X-Preserve"].as_str(), Some("manual"));
         assert_eq!(provider["env_http_headers"]["X-Feature"].as_str(), Some("GATEWAY_FEATURE"));
         assert_eq!(provider["experimental_bearer_token"].as_str(), Some("test-provider-key"));
-        assert!(!live.contains("127.0.0.1"));
+        assert_eq!(codex_plus_core::relay_config::relay_profile_base_url(&profile), "https://gateway.example.test/turnstile/llm");
     }
 }
 
 #[test]
-fn native_headers_can_be_changed_and_removed_after_backfill() {
+fn custom_headers_can_be_changed_and_removed_after_proxy_backfill() {
     let temp = tempfile::tempdir().unwrap();
     let mut profile = native_headers_profile();
     apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
@@ -244,7 +245,9 @@ fn native_headers_can_be_changed_and_removed_after_backfill() {
     profile.custom_headers[0].value = "replacement-subscription".to_string();
     apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
     let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
-    assert!(live.contains("replacement-subscription"));
+    assert!(!live.contains("replacement-subscription"));
+    assert!(live.contains("127.0.0.1:57321"));
+    assert_eq!(profile.custom_headers[0].value, "replacement-subscription");
     assert!(!live.contains("test-subscription"));
     backfill_relay_profile_from_home(temp.path(), &mut profile).unwrap();
     assert!(!profile.config_contents.contains("replacement-subscription"));
@@ -258,10 +261,12 @@ fn native_headers_can_be_changed_and_removed_after_backfill() {
     assert_eq!(headers.get("X-Preserve").unwrap().as_str(), Some("manual"));
     assert!(!live.contains("Subscription-Key"));
     assert!(!live.contains("x-project-id"));
+    assert!(live.contains("https://gateway.example.test/turnstile/llm"));
+    assert!(!live.contains("127.0.0.1:57321"));
 }
 
 #[test]
-fn native_headers_override_case_insensitive_static_and_environment_headers() {
+fn custom_headers_preserve_manual_static_and_environment_headers() {
     let temp = tempfile::tempdir().unwrap();
     let mut profile = native_headers_profile();
     profile.config_contents.push_str(r#"
@@ -281,9 +286,9 @@ fn native_headers_override_case_insensitive_static_and_environment_headers() {
     let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     let doc = live.parse::<toml_edit::DocumentMut>().unwrap();
     let provider = &doc["model_providers"]["gateway"];
-    assert_eq!(provider["http_headers"].as_table_like().unwrap().len(), 3);
-    assert_eq!(provider["http_headers"]["Ocp-Apim-Subscription-Key"].as_str(), Some("test-subscription"));
-    assert_eq!(provider["env_http_headers"].as_table_like().unwrap().len(), 1);
+    assert_eq!(provider["http_headers"].as_table_like().unwrap().len(), 2);
+    assert_eq!(provider["http_headers"]["ocp-apim-subscription-key"].as_str(), Some("manual-subscription"));
+    assert_eq!(provider["env_http_headers"].as_table_like().unwrap().len(), 2);
     backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut String::new()).unwrap();
     let snapshot = profile.config_contents.parse::<toml_edit::DocumentMut>().unwrap();
     let provider = &snapshot["model_providers"]["gateway"];
@@ -293,7 +298,7 @@ fn native_headers_override_case_insensitive_static_and_environment_headers() {
 }
 
 #[test]
-fn native_headers_authorization_takes_precedence_without_losing_saved_credentials() {
+fn custom_headers_migrate_legacy_authorization_without_losing_saved_credentials() {
     let temp = tempfile::tempdir().unwrap();
     let mut profile = native_headers_profile();
     profile.custom_headers.push(RelayHeaderKeyValue {
@@ -304,14 +309,37 @@ fn native_headers_authorization_takes_precedence_without_losing_saved_credential
         "[model_providers.gateway]",
         "[model_providers.gateway]\nenv_key = \"GATEWAY_KEY\"\nrequires_openai_auth = true",
     );
-    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    normalize_relay_profile_for_storage(&mut profile).unwrap();
+    let mut legacy = profile.config_contents.parse::<toml_edit::DocumentMut>().unwrap();
+    legacy["model"] = toml_edit::value("user-selected-model");
+    legacy["live_only"] = toml_edit::value("preserve");
+    let provider = legacy["model_providers"]["gateway"].as_table_mut().unwrap();
+    provider["base_url"] = toml_edit::value("https://gateway.example.test/turnstile/llm");
+    provider["http_headers"]["Authorization"] = toml_edit::value("Custom explicit-auth");
+    provider["requires_openai_auth"] = toml_edit::value(false);
+    provider.remove("experimental_bearer_token");
+    provider.remove("env_key");
+    std::fs::write(temp.path().join("config.toml"), legacy.to_string()).unwrap();
+    let settings = BackendSettings {
+        relay_profiles_enabled: true,
+        enhancements_enabled: false,
+        active_relay_id: profile.id.clone(),
+        relay_profiles: vec![profile.clone()],
+        ..BackendSettings::default()
+    };
+    assert!(ensure_active_protocol_proxy_config_in_home(temp.path(), &settings).unwrap());
+    assert!(!ensure_active_protocol_proxy_config_in_home(temp.path(), &settings).unwrap());
     let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
     let doc = live.parse::<toml_edit::DocumentMut>().unwrap();
     let provider = &doc["model_providers"]["gateway"];
-    assert_eq!(provider["http_headers"]["Authorization"].as_str(), Some("Custom explicit-auth"));
-    assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
-    assert!(provider.as_table().unwrap().get("experimental_bearer_token").is_none());
-    assert!(provider.as_table().unwrap().get("env_key").is_none());
+    assert_eq!(provider["base_url"].as_str(), Some("http://127.0.0.1:57321/v1"));
+    assert!(!live.contains("Custom explicit-auth"));
+    assert_eq!(provider["http_headers"]["X-Preserve"].as_str(), Some("manual"));
+    assert_eq!(provider["requires_openai_auth"].as_bool(), Some(true));
+    assert_eq!(provider["experimental_bearer_token"].as_str(), Some("test-provider-key"));
+    assert_eq!(provider["env_key"].as_str(), Some("GATEWAY_KEY"));
+    assert_eq!(doc["model"].as_str(), Some("user-selected-model"));
+    assert_eq!(doc["live_only"].as_str(), Some("preserve"));
     backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut String::new()).unwrap();
     assert_eq!(relay_profile_api_key(&profile), "test-provider-key");
     assert!(!profile.config_contents.contains("Custom explicit-auth"));
@@ -321,7 +349,7 @@ fn native_headers_authorization_takes_precedence_without_losing_saved_credential
 }
 
 #[test]
-fn native_headers_do_not_leak_when_switching_suppliers() {
+fn custom_headers_do_not_leak_when_switching_suppliers() {
     let temp = tempfile::tempdir().unwrap();
     let profile = native_headers_profile();
     apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
@@ -341,7 +369,7 @@ fn native_headers_do_not_leak_when_switching_suppliers() {
 }
 
 #[test]
-fn native_headers_preserve_existing_proxy_transports() {
+fn custom_headers_preserve_existing_proxy_transports() {
     for protocol in [RelayProtocol::Responses, RelayProtocol::ChatCompletions] {
         let temp = tempfile::tempdir().unwrap();
         let mut profile = native_headers_profile();
@@ -362,7 +390,7 @@ fn native_headers_preserve_existing_proxy_transports() {
 }
 
 #[test]
-fn native_headers_reject_forbidden_headers_before_writing_live_config() {
+fn custom_headers_reject_forbidden_headers_before_writing_live_config() {
     let temp = tempfile::tempdir().unwrap();
     let mut profile = native_headers_profile();
     profile.custom_headers.push(RelayHeaderKeyValue {
@@ -373,6 +401,64 @@ fn native_headers_reject_forbidden_headers_before_writing_live_config() {
     assert!(error.to_string().contains("不允许覆盖"));
     assert!(!error.to_string().contains("private-value"));
     assert!(!temp.path().join("config.toml").exists());
+}
+
+#[test]
+fn custom_headers_migrate_legacy_subscription_and_preserve_manual_headers() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut profile = native_headers_profile();
+    let mut legacy = profile.config_contents.parse::<toml_edit::DocumentMut>().unwrap();
+    legacy["model_providers"]["gateway"]["base_url"] = toml_edit::value("https://gateway.example.test/turnstile/llm");
+    legacy["model_providers"]["gateway"]["http_headers"]["Ocp-Apim-Subscription-Key"] = toml_edit::value("test-subscription");
+    legacy["model_providers"]["gateway"]["http_headers"]["x-project-id"] = toml_edit::value("test-project");
+    std::fs::write(temp.path().join("config.toml"), legacy.to_string()).unwrap();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut String::new()).unwrap();
+    assert!(!profile.config_contents.contains("test-subscription"));
+    assert!(profile.config_contents.contains("X-Preserve"));
+    assert_eq!(profile.upstream_base_url, "https://gateway.example.test/turnstile/llm");
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(!live.contains("test-subscription"));
+    assert!(live.contains("127.0.0.1:57321"));
+}
+
+#[test]
+fn custom_headers_and_schema_compat_backfill_recognize_saved_custom_proxy_ports() {
+    for schema_compat in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut profile = native_headers_profile();
+        if schema_compat {
+            profile.custom_headers.clear();
+            profile.responses_tool_schema_compat = true;
+            normalize_relay_profile_for_storage(&mut profile).unwrap();
+        }
+        profile.config_contents = profile.config_contents.replace(
+            "http://127.0.0.1:57321/v1", "http://127.0.0.1:58081/v1",
+        );
+        std::fs::write(temp.path().join("config.toml"), &profile.config_contents).unwrap();
+        backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut String::new()).unwrap();
+        assert_eq!(profile.base_url, "https://gateway.example.test/turnstile/llm");
+        assert_eq!(profile.upstream_base_url, "https://gateway.example.test/turnstile/llm");
+        assert_ne!(profile.upstream_base_url, "http://127.0.0.1:58081/v1");
+    }
+}
+
+#[test]
+fn responses_schema_compat_uses_proxy_only_when_enabled_and_preserves_upstream() {
+    for enabled in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut profile = native_headers_profile();
+        profile.custom_headers.clear();
+        profile.responses_tool_schema_compat = enabled;
+        normalize_relay_profile_for_storage(&mut profile).unwrap();
+        apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+        let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+        assert_eq!(live.contains("127.0.0.1:57321"), enabled);
+        backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut String::new()).unwrap();
+        assert_eq!(profile.base_url, "https://gateway.example.test/turnstile/llm");
+        assert_eq!(profile.upstream_base_url, "https://gateway.example.test/turnstile/llm");
+        assert_eq!(profile.responses_tool_schema_compat, enabled);
+    }
 }
 
 fn write_remote_plugin_marketplace_snapshot(home: &std::path::Path) {

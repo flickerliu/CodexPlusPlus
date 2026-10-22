@@ -121,6 +121,8 @@ pub struct RelayProfile {
         skip_serializing_if = "is_false"
     )]
     pub standard_openai_protocol: bool,
+    #[serde(rename = "responsesToolSchemaCompat", default, skip_serializing_if = "is_false")]
+    pub responses_tool_schema_compat: bool,
     #[serde(rename = "rateLimitCooldownEnabled", default)]
     pub rate_limit_cooldown_enabled: bool,
     #[serde(rename = "channelQueueEnabled", default)]
@@ -264,6 +266,7 @@ impl Default for RelayProfile {
             model_routes: Vec::new(),
             custom_headers: Vec::new(),
             standard_openai_protocol: false,
+            responses_tool_schema_compat: false,
             rate_limit_cooldown_enabled: false,
             channel_queue_enabled: false,
             channel_requests_per_minute: default_channel_requests_per_minute(),
@@ -275,6 +278,15 @@ impl Default for RelayProfile {
 impl RelayProfile {
     pub fn uses_no_auth(&self) -> bool {
         self.relay_mode == RelayMode::PureApi && self.no_auth
+    }
+
+    pub fn uses_protocol_proxy(&self) -> bool {
+        self.relay_mode == RelayMode::Aggregate
+            || self.protocol == RelayProtocol::ChatCompletions
+            || self.has_model_routes()
+            || self.uses_no_auth()
+            || self.custom_headers.iter().any(|header| !header.key.trim().is_empty())
+            || (self.protocol == RelayProtocol::Responses && self.responses_tool_schema_compat)
     }
 
     pub fn has_model_routes(&self) -> bool {
@@ -812,6 +824,7 @@ impl BackendSettings {
                 model_routes: Vec::new(),
                 custom_headers: Vec::new(),
                 standard_openai_protocol: false,
+                responses_tool_schema_compat: false,
                 rate_limit_cooldown_enabled: false,
                 channel_queue_enabled: false,
                 channel_requests_per_minute: default_channel_requests_per_minute(),
@@ -872,6 +885,7 @@ impl BackendSettings {
             model_routes: Vec::new(),
             custom_headers: Vec::new(),
             standard_openai_protocol: false,
+            responses_tool_schema_compat: false,
             rate_limit_cooldown_enabled: false,
             channel_queue_enabled: false,
             channel_requests_per_minute: default_channel_requests_per_minute(),
@@ -928,9 +942,7 @@ impl BackendSettings {
 
     pub fn active_relay_transport_uses_protocol_proxy(&self) -> bool {
         self.active_aggregate_relay_profile().is_some()
-            || self.active_relay_profile().protocol == RelayProtocol::ChatCompletions
-            || self.active_relay_profile().has_model_routes()
-            || self.active_relay_profile().uses_no_auth()
+            || self.active_relay_profile().uses_protocol_proxy()
     }
 
     pub fn active_relay_uses_protocol_proxy(&self) -> bool {
@@ -3970,6 +3982,35 @@ experimental_bearer_token = "sk-existing""#
 
         assert!(!updated.provider_sync_enabled);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn responses_schema_compat_defaults_off_and_round_trips() {
+        let mut profile = RelayProfile::default();
+        let legacy = serde_json::to_value(&profile).unwrap();
+        assert!(legacy.get("responsesToolSchemaCompat").is_none());
+        assert!(!serde_json::from_value::<RelayProfile>(legacy).unwrap().responses_tool_schema_compat);
+        profile.responses_tool_schema_compat = true;
+        let enabled = serde_json::to_value(&profile).unwrap();
+        assert_eq!(enabled["responsesToolSchemaCompat"], json!(true));
+        assert!(serde_json::from_value::<RelayProfile>(enabled).unwrap().responses_tool_schema_compat);
+    }
+
+    #[test]
+    fn custom_headers_and_responses_schema_compat_require_proxy_without_enhancements() {
+        let mut settings = BackendSettings {
+            enhancements_enabled: false,
+            relay_profiles: vec![RelayProfile { relay_mode: RelayMode::PureApi, ..RelayProfile::default() }],
+            ..BackendSettings::default()
+        };
+        assert!(!settings.active_relay_transport_uses_protocol_proxy());
+        settings.relay_profiles[0].custom_headers.push(RelayHeaderKeyValue::default());
+        assert!(!settings.active_relay_transport_uses_protocol_proxy());
+        settings.relay_profiles[0].custom_headers[0].key = "X-Empty-Value".to_string();
+        assert!(settings.active_relay_transport_uses_protocol_proxy());
+        settings.relay_profiles[0].custom_headers.clear();
+        settings.relay_profiles[0].responses_tool_schema_compat = true;
+        assert!(settings.active_relay_transport_uses_protocol_proxy());
     }
 
     #[test]
