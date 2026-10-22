@@ -1144,6 +1144,8 @@ export const EN_PLAIN: Record<string, string> = {
   "重新检测": "Check again",
   "排查可能干扰中转站配置的本机环境": "Find local environment settings that may interfere with relay configuration",
   "单模型路由": "Per-model routing",
+  "自定义请求头会同时用于测试连接、模型列表与实际对话。Responses 直连会写入 Codex 原生 http_headers；需要协议代理时由代理添加。":
+    "Custom headers apply to connection tests, model lists, and conversations. Direct Responses connections use Codex's native http_headers; proxied connections add headers in the proxy.",
   "首次启用单模型路由需要启动本地协议代理。保存后将立即重启 Codex，使路由安全生效。是否继续？":
     "Enabling per-model routing for the first time requires the local protocol proxy. Codex will restart immediately after saving so routing can take effect safely. Continue?",
   "匹配模型": "Match model",

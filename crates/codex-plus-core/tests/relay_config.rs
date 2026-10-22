@@ -3,6 +3,7 @@ use codex_plus_core::relay_config::{
     apply_pure_api_config_to_home, apply_relay_config_file_to_home, apply_relay_config_to_home,
     apply_relay_files_to_home, apply_relay_files_to_home_with_common,
     apply_relay_profile_files_to_home_with_context, apply_relay_profile_to_home_with_switch_rules,
+    apply_relay_profile_config_to_home_with_context,
     backfill_relay_profile_from_home, backfill_relay_profile_from_home_with_common,
     chatgpt_auth_status_from_home, cleanup_unsupported_approval_policies_in_home,
     clear_relay_config_to_home, clear_relay_config_to_home_with_auth,
@@ -15,7 +16,7 @@ use codex_plus_core::relay_config::{
     upsert_context_entry_in_common_config,
 };
 use codex_plus_core::settings::{
-    BackendSettings, RelayMode, RelayModelRoute, RelayProfile, RelayProtocol,
+    BackendSettings, RelayHeaderKeyValue, RelayMode, RelayModelRoute, RelayProfile, RelayProtocol,
 };
 
 /// 把路径安全地写进 config.toml 的种子文本里。
@@ -167,6 +168,211 @@ fn normalize_relay_profile_keeps_custom_headers() {
     assert_eq!(profile.custom_headers.len(), 1);
     assert_eq!(profile.custom_headers[0].key, "X-Tenant");
     assert_eq!(profile.custom_headers[0].value, "acme");
+}
+
+fn native_headers_profile() -> RelayProfile {
+    let mut profile = RelayProfile {
+        id: "native-headers".to_string(),
+        relay_mode: RelayMode::PureApi,
+        protocol: RelayProtocol::Responses,
+        model: "gateway-model".to_string(),
+        base_url: "https://gateway.example.test/turnstile/llm".to_string(),
+        api_key: "test-provider-key".to_string(),
+        config_contents: r#"model_provider = "gateway"
+
+[model_providers.gateway]
+name = "Gateway"
+base_url = "https://gateway.example.test/turnstile/llm"
+http_headers = { "X-Preserve" = "manual" }
+env_http_headers = { "X-Feature" = "GATEWAY_FEATURE" }
+"#.to_string(),
+        custom_headers: vec![
+            RelayHeaderKeyValue {
+                key: "Ocp-Apim-Subscription-Key".to_string(),
+                value: "test-subscription".to_string(),
+            },
+            RelayHeaderKeyValue {
+                key: "x-project-id".to_string(),
+                value: "test-project".to_string(),
+            },
+        ],
+        ..RelayProfile::default()
+    };
+    normalize_relay_profile_for_storage(&mut profile).unwrap();
+    profile
+}
+
+#[test]
+fn native_headers_are_written_by_every_profile_apply_entrypoint_without_proxy() {
+    let profile = native_headers_profile();
+    let settings = BackendSettings {
+        enhancements_enabled: false,
+        relay_profiles: vec![profile.clone()],
+        ..BackendSettings::default()
+    };
+    assert!(!settings.active_relay_uses_protocol_proxy());
+    assert!(!profile.config_contents.contains("test-subscription"));
+
+    for entrypoint in 0..3 {
+        let temp = tempfile::tempdir().unwrap();
+        match entrypoint {
+            0 => apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, ""),
+            1 => apply_relay_profile_files_to_home_with_context(temp.path(), &profile, ""),
+            _ => apply_relay_profile_config_to_home_with_context(temp.path(), &profile, ""),
+        }.unwrap();
+        let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+        let doc = live.parse::<toml_edit::DocumentMut>().unwrap();
+        let provider = &doc["model_providers"]["gateway"];
+        assert_eq!(provider["base_url"].as_str(), Some("https://gateway.example.test/turnstile/llm"));
+        assert_eq!(provider["http_headers"]["Ocp-Apim-Subscription-Key"].as_str(), Some("test-subscription"));
+        assert_eq!(provider["http_headers"]["x-project-id"].as_str(), Some("test-project"));
+        assert_eq!(provider["http_headers"]["X-Preserve"].as_str(), Some("manual"));
+        assert_eq!(provider["env_http_headers"]["X-Feature"].as_str(), Some("GATEWAY_FEATURE"));
+        assert_eq!(provider["experimental_bearer_token"].as_str(), Some("test-provider-key"));
+        assert!(!live.contains("127.0.0.1"));
+    }
+}
+
+#[test]
+fn native_headers_can_be_changed_and_removed_after_backfill() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut profile = native_headers_profile();
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut String::new()).unwrap();
+    assert!(!profile.config_contents.contains("test-subscription"));
+    assert_eq!(profile.custom_headers[0].value, "test-subscription");
+    profile.custom_headers[0].value = "replacement-subscription".to_string();
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(live.contains("replacement-subscription"));
+    assert!(!live.contains("test-subscription"));
+    backfill_relay_profile_from_home(temp.path(), &mut profile).unwrap();
+    assert!(!profile.config_contents.contains("replacement-subscription"));
+    profile.custom_headers.clear();
+    normalize_relay_profile_for_storage(&mut profile).unwrap();
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    let doc = live.parse::<toml_edit::DocumentMut>().unwrap();
+    let headers = doc["model_providers"]["gateway"]["http_headers"].as_table_like().unwrap();
+    assert_eq!(headers.len(), 1);
+    assert_eq!(headers.get("X-Preserve").unwrap().as_str(), Some("manual"));
+    assert!(!live.contains("Subscription-Key"));
+    assert!(!live.contains("x-project-id"));
+}
+
+#[test]
+fn native_headers_override_case_insensitive_static_and_environment_headers() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut profile = native_headers_profile();
+    profile.config_contents.push_str(r#"
+[model_providers.gateway.http_headers]
+"ocp-apim-subscription-key" = "manual-subscription"
+"X-Preserve" = "manual"
+"#);
+    // 使用独立子表输入，覆盖上述模板的行内表。
+    profile.config_contents = profile.config_contents.replace(
+        "http_headers = { \"X-Preserve\" = \"manual\" }\n", "",
+    );
+    profile.config_contents = profile.config_contents.replace(
+        "env_http_headers = { \"X-Feature\" = \"GATEWAY_FEATURE\" }",
+        "env_http_headers = { \"X-Feature\" = \"GATEWAY_FEATURE\", \"OCP-APIM-SUBSCRIPTION-KEY\" = \"OLD_SUBSCRIPTION\" }",
+    );
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    let doc = live.parse::<toml_edit::DocumentMut>().unwrap();
+    let provider = &doc["model_providers"]["gateway"];
+    assert_eq!(provider["http_headers"].as_table_like().unwrap().len(), 3);
+    assert_eq!(provider["http_headers"]["Ocp-Apim-Subscription-Key"].as_str(), Some("test-subscription"));
+    assert_eq!(provider["env_http_headers"].as_table_like().unwrap().len(), 1);
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut String::new()).unwrap();
+    let snapshot = profile.config_contents.parse::<toml_edit::DocumentMut>().unwrap();
+    let provider = &snapshot["model_providers"]["gateway"];
+    assert_eq!(provider["http_headers"]["ocp-apim-subscription-key"].as_str(), Some("manual-subscription"));
+    assert_eq!(provider["env_http_headers"]["OCP-APIM-SUBSCRIPTION-KEY"].as_str(), Some("OLD_SUBSCRIPTION"));
+    assert!(!profile.config_contents.contains("test-subscription"));
+}
+
+#[test]
+fn native_headers_authorization_takes_precedence_without_losing_saved_credentials() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut profile = native_headers_profile();
+    profile.custom_headers.push(RelayHeaderKeyValue {
+        key: "Authorization".to_string(),
+        value: "Custom explicit-auth".to_string(),
+    });
+    profile.config_contents = profile.config_contents.replace(
+        "[model_providers.gateway]",
+        "[model_providers.gateway]\nenv_key = \"GATEWAY_KEY\"\nrequires_openai_auth = true",
+    );
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    let doc = live.parse::<toml_edit::DocumentMut>().unwrap();
+    let provider = &doc["model_providers"]["gateway"];
+    assert_eq!(provider["http_headers"]["Authorization"].as_str(), Some("Custom explicit-auth"));
+    assert_eq!(provider["requires_openai_auth"].as_bool(), Some(false));
+    assert!(provider.as_table().unwrap().get("experimental_bearer_token").is_none());
+    assert!(provider.as_table().unwrap().get("env_key").is_none());
+    backfill_relay_profile_from_home_with_common(temp.path(), &mut profile, &mut String::new()).unwrap();
+    assert_eq!(relay_profile_api_key(&profile), "test-provider-key");
+    assert!(!profile.config_contents.contains("Custom explicit-auth"));
+    let snapshot = profile.config_contents.parse::<toml_edit::DocumentMut>().unwrap();
+    assert_eq!(snapshot["model_providers"]["gateway"]["requires_openai_auth"].as_bool(), Some(true));
+    assert_eq!(snapshot["model_providers"]["gateway"]["env_key"].as_str(), Some("GATEWAY_KEY"));
+}
+
+#[test]
+fn native_headers_do_not_leak_when_switching_suppliers() {
+    let temp = tempfile::tempdir().unwrap();
+    let profile = native_headers_profile();
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+    let other = RelayProfile {
+        id: "other".to_string(),
+        relay_mode: RelayMode::PureApi,
+        base_url: "https://other.example.test/v1".to_string(),
+        api_key: "other-key".to_string(),
+        ..RelayProfile::default()
+    };
+    apply_relay_profile_to_home_with_switch_rules(temp.path(), &other, "").unwrap();
+    let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+    assert!(live.contains("https://other.example.test/v1"));
+    assert!(!live.contains("test-subscription"));
+    assert!(!live.contains("x-project-id"));
+    assert!(!live.contains("http_headers"));
+}
+
+#[test]
+fn native_headers_preserve_existing_proxy_transports() {
+    for protocol in [RelayProtocol::Responses, RelayProtocol::ChatCompletions] {
+        let temp = tempfile::tempdir().unwrap();
+        let mut profile = native_headers_profile();
+        profile.protocol = protocol;
+        if protocol == RelayProtocol::Responses {
+            profile.model_routes = vec![RelayModelRoute {
+                model: "routed-model".to_string(),
+                target_relay_id: "other".to_string(),
+                target_model: String::new(),
+            }];
+        }
+        apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap();
+        let live = std::fs::read_to_string(temp.path().join("config.toml")).unwrap();
+        assert!(live.contains(r#"base_url = "http://127.0.0.1:57321/v1""#));
+        assert!(!live.contains("test-subscription"));
+        assert_eq!(profile.custom_headers[0].value, "test-subscription");
+    }
+}
+
+#[test]
+fn native_headers_reject_forbidden_headers_before_writing_live_config() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut profile = native_headers_profile();
+    profile.custom_headers.push(RelayHeaderKeyValue {
+        key: "Host".to_string(),
+        value: "private-value".to_string(),
+    });
+    let error = apply_relay_profile_to_home_with_switch_rules(temp.path(), &profile, "").unwrap_err();
+    assert!(error.to_string().contains("不允许覆盖"));
+    assert!(!error.to_string().contains("private-value"));
+    assert!(!temp.path().join("config.toml").exists());
 }
 
 fn write_remote_plugin_marketplace_snapshot(home: &std::path::Path) {

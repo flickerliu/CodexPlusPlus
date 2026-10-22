@@ -9006,7 +9006,7 @@ function RelayProfileEditor({
                     </Button>
                   </div>
                   <span className="hint-line">
-                    {t("自定义请求头会同时用于测试连接、模型列表与实际代理请求。")}
+                    {t("自定义请求头会同时用于测试连接、模型列表与实际对话。Responses 直连会写入 Codex 原生 http_headers；需要协议代理时由代理添加。")}
                   </span>
                   <span className="hint-line">
                     {t("Host、Content-Length 等传输头由协议层掌控，不能覆盖；配置 Authorization 时以它为准，不再注入 API Key。")}

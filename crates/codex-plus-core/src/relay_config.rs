@@ -560,6 +560,7 @@ pub fn apply_relay_profile_files_to_home_with_context(
             apply_model_catalog_to_config(home, profile, &config_with_limits)?;
         let compatible_config =
             apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
+        let compatible_config = apply_native_relay_headers_to_config(profile, &compatible_config)?;
         // 聚合 profile 的快照里没有凭据，必须现生成一份含代理 token 的合法 JSON，
         // 否则会把 auth.json 写成空文件（issue #1604）。
         let auth_contents = if profile.relay_mode == crate::settings::RelayMode::Aggregate {
@@ -724,6 +725,7 @@ pub fn apply_relay_profile_to_home_with_switch_rules(
             apply_model_catalog_to_config(home, profile, &config_with_limits)?;
         let compatible_config =
             apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
+        let compatible_config = apply_native_relay_headers_to_config(profile, &compatible_config)?;
 
         if profile.relay_mode == crate::settings::RelayMode::PureApi {
             // 与 Aggregate / Official 分支对称：先读 live auth.json 再合并，
@@ -773,6 +775,7 @@ pub fn apply_relay_profile_config_to_home_with_context(
             apply_model_catalog_to_config(home, profile, &config_with_limits)?;
         let compatible_config =
             apply_deepseek_responses_compatibility(profile, &config_with_catalog)?;
+        let compatible_config = apply_native_relay_headers_to_config(profile, &compatible_config)?;
         apply_relay_config_file_to_home(home, &compatible_config)
     })
 }
@@ -1110,6 +1113,8 @@ pub fn backfill_relay_profile_from_home(
     profile: &mut RelayProfile,
 ) -> anyhow::Result<()> {
     let live_contents = read_optional_text(&home.join("config.toml"))?;
+    let live_contents =
+        strip_native_relay_headers_from_backfill(profile, &live_contents, &profile.config_contents)?;
     profile.config_contents = strip_tool_written_model_from_config(home, profile, &live_contents);
     profile.auth_contents = read_optional_text(&home.join("auth.json"))?;
     let live_config = profile.config_contents.clone();
@@ -1241,6 +1246,13 @@ fn backfill_profile_from_text(
         restore_profile_provider_id_for_backfill(&profile.config_contents, &template_config)?;
     profile.config_contents =
         strip_tool_written_model_from_config(home, profile, &profile.config_contents);
+    if policy == RelayBackfillPolicy::PreserveIdentity {
+        profile.config_contents = strip_native_relay_headers_from_backfill(
+            profile,
+            &profile.config_contents,
+            &template_config,
+        )?;
+    }
     if profile.protocol == RelayProtocol::Responses
         && managed_proxy
         && !template_base_url.trim().is_empty()
@@ -4360,6 +4372,139 @@ pub fn relay_profile_api_key(profile: &RelayProfile) -> String {
         })
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| profile.api_key.trim().to_string())
+}
+
+fn native_relay_headers_provider_id(
+    profile: &RelayProfile,
+    doc: &DocumentMut,
+) -> Option<String> {
+    if profile.protocol != RelayProtocol::Responses
+        || profile.has_model_routes()
+        || profile.uses_no_auth()
+        || profile.relay_mode == RelayMode::Aggregate
+        || (profile.relay_mode == RelayMode::Official && !profile.official_mix_api_key)
+        || active_session_provider_id(doc) == "openai"
+        || !profile.custom_headers.iter().any(|header| !header.key.trim().is_empty())
+    {
+        return None;
+    }
+    Some(active_or_default_provider_id(doc))
+}
+
+fn apply_native_relay_headers_to_config(
+    profile: &RelayProfile,
+    config: &str,
+) -> anyhow::Result<String> {
+    let mut doc = parse_toml_document(config)?;
+    let Some(provider_id) = native_relay_headers_provider_id(profile, &doc) else {
+        return Ok(config.to_string());
+    };
+    crate::relay_headers::validate(&profile.custom_headers)?;
+    let provider = ensure_provider_table(&mut doc, &provider_id)?;
+    for field in ["http_headers", "env_http_headers"] {
+        if field == "http_headers" && !provider.contains_key(field) {
+            provider[field] = toml_edit::value(toml_edit::InlineTable::new());
+        }
+        let Some(item) = provider.get_mut(field) else {
+            continue;
+        };
+        let table = item.as_table_like_mut().ok_or_else(|| {
+            anyhow::anyhow!("供应商配置 model_providers.{provider_id}.{field} 必须是请求头表")
+        })?;
+        let conflicts: Vec<String> = table
+            .iter()
+            .filter(|(key, _)| profile.custom_headers.iter().any(|header| {
+                key.eq_ignore_ascii_case(header.key.trim())
+            }))
+            .map(|(key, _)| key.to_string())
+            .collect();
+        for key in conflicts {
+            table.remove(&key);
+        }
+        if field == "http_headers" {
+            for header in &profile.custom_headers {
+                if !header.key.trim().is_empty() {
+                    table.insert(header.key.trim(), toml_edit::value(header.value.as_str()));
+                }
+            }
+        }
+        if table.is_empty() {
+            provider.remove(field);
+        }
+    }
+    if crate::relay_headers::has_authorization(&profile.custom_headers) {
+        for field in ["experimental_bearer_token", "env_key", "auth"] {
+            provider.remove(field);
+        }
+        provider["requires_openai_auth"] = toml_edit::value(false);
+    }
+    Ok(ensure_trailing_newline(doc.to_string()))
+}
+
+fn strip_native_relay_headers_from_backfill(
+    profile: &RelayProfile,
+    config: &str,
+    template: &str,
+) -> anyhow::Result<String> {
+    let mut doc = parse_toml_document(config)?;
+    let Some(provider_id) = native_relay_headers_provider_id(profile, &doc) else {
+        return Ok(config.to_string());
+    };
+    let template_doc = parse_toml_document(template)?;
+    let template_provider = template_doc
+        .get("model_providers")
+        .and_then(Item::as_table)
+        .and_then(|providers| providers.get(&provider_id))
+        .and_then(Item::as_table);
+    let provider = ensure_provider_table(&mut doc, &provider_id)?;
+    // 自定义头只投影到运行配置；回填时还原模板，避免删除 UI 配置后旧密钥残留。
+    for field in ["http_headers", "env_http_headers"] {
+        let original = template_provider.and_then(|provider| provider.get(field));
+        if !provider.contains_key(field) && original.is_some() {
+            provider[field] = toml_edit::value(toml_edit::InlineTable::new());
+        }
+        let Some(item) = provider.get_mut(field) else {
+            continue;
+        };
+        let table = item.as_table_like_mut().ok_or_else(|| {
+            anyhow::anyhow!("供应商配置 model_providers.{provider_id}.{field} 必须是请求头表")
+        })?;
+        if field == "http_headers" {
+            let projected: Vec<String> = table
+                .iter()
+                .filter(|(key, value)| profile.custom_headers.iter().any(|header| {
+                    key.eq_ignore_ascii_case(header.key.trim())
+                        && value.as_str() == Some(header.value.as_str())
+                }))
+                .map(|(key, _)| key.to_string())
+                .collect();
+            for key in projected {
+                table.remove(&key);
+            }
+        }
+        if let Some(original) = original.and_then(Item::as_table_like) {
+            for (key, value) in original.iter() {
+                let managed = profile.custom_headers.iter().any(|header| {
+                    key.eq_ignore_ascii_case(header.key.trim())
+                });
+                if managed && !table.iter().any(|(current, _)| current.eq_ignore_ascii_case(key)) {
+                    table.insert(key, value.clone());
+                }
+            }
+        }
+        if table.is_empty() {
+            provider.remove(field);
+        }
+    }
+    if crate::relay_headers::has_authorization(&profile.custom_headers) {
+        for field in ["experimental_bearer_token", "env_key", "auth", "requires_openai_auth"] {
+            match template_provider.and_then(|provider| provider.get(field)) {
+                Some(value) => { provider.insert(field, value.clone()); }
+                None => { provider.remove(field); }
+            }
+        }
+    }
+    Ok(ensure_trailing_newline(doc.to_string()))
 }
 
 fn complete_relay_profile_config(profile: &RelayProfile) -> anyhow::Result<String> {
