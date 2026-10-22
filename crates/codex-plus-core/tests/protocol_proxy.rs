@@ -4378,6 +4378,67 @@ fn session_header_settings(protocol: RelayProtocol, base_url: String) -> Backend
 }
 
 #[tokio::test]
+async fn responses_schema_compat_preserves_native_object_schemas_and_reasoning() {
+    let request = json!({
+        "model": "schema-preservation-probe",
+        "input": "hello",
+        "stream": false,
+        "reasoning": {"effort": "high"},
+        "tool_choice": {
+            "type": "function", "namespace": "collaboration", "name": "send_message"
+        },
+        "tools": [
+            {
+                "type": "namespace", "name": "collaboration",
+                "description": "unchanged native namespace",
+                "tools": [
+                    {
+                        "type": "function", "name": "list_agents", "strict": true,
+                        "parameters": {
+                            "type": "object", "properties": {}, "additionalProperties": false
+                        }
+                    },
+                    {
+                        "type": "function", "name": "send_message", "strict": false,
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "recipient": {
+                                    "$ref": "#/$defs/agent_id",
+                                    "description": "Keep this reference and its sibling unchanged"
+                                },
+                                "message": {
+                                    "anyOf": [{"type": "string"}, {"type": "null"}]
+                                }
+                            },
+                            "required": ["recipient", "message"],
+                            "$defs": {"agent_id": {"type": "string"}},
+                            "additionalProperties": false
+                        }
+                    }
+                ]
+            },
+            {
+                "type": "function", "name": "any_object",
+                "parameters": {"type": "object"}
+            }
+        ]
+    });
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(capture_request_with_response(
+        listener, "application/json", "{}".to_string(),
+    ));
+    let mut settings = session_header_settings(RelayProtocol::Responses, format!("http://{address}/v1"));
+    settings.relay_profiles[0].responses_tool_schema_compat = true;
+    let result = open_responses_proxy_request_with_settings(&request.to_string(), settings).await.unwrap();
+    assert_eq!(result.status_code, 200);
+    assert!(result.responses_tool_compat.is_none());
+    let (_, body) = server.await.unwrap();
+    assert_eq!(body, request);
+}
+
+#[tokio::test]
 async fn responses_schema_compat_preserves_namespaces_headers_and_streams() {
     let request = json!({
         "model": "session-probe", "input": "hello", "stream": true,
@@ -4434,7 +4495,16 @@ async fn responses_schema_compat_preserves_namespaces_headers_and_streams() {
                 }
             },
             {"type": "custom", "name": "apply_patch", "description": "fixture patch",
-             "format": {"type": "text"}}
+             "format": {"type": "text"}},
+            {
+                "type": "namespace", "name": "collaboration",
+                "tools": [{
+                    "type": "function", "name": "list_agents",
+                    "parameters": {
+                        "type": "object", "properties": {}, "additionalProperties": false
+                    }
+                }]
+            }
         ]
     });
     let sse = "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"name\":\"automation_update\",\"namespace\":\"automations\",\"call_id\":\"call_1\",\"arguments\":\"{}\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compat\"}}\n\n";
@@ -4468,7 +4538,8 @@ async fn responses_schema_compat_preserves_namespaces_headers_and_streams() {
             assert_eq!(body["tools"], request["tools"]);
             continue;
         }
-        assert_eq!(body["tools"].as_array().unwrap().len(), 4);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(body["tools"][4], request["tools"][4]);
         assert_eq!(body["tools"][3]["type"], "function");
         assert_eq!(body["tools"][3]["name"], "apply_patch");
         assert_eq!(body["tools"][3]["parameters"]["properties"]["input"]["type"], "string");
@@ -4501,6 +4572,9 @@ async fn responses_schema_compat_preserves_namespaces_headers_and_streams() {
 #[tokio::test]
 async fn responses_schema_compat_rejects_unsupported_constraints_without_sending_empty_schemas() {
     for parameters in [
+        json!({"type": "object", "properties": []}),
+        json!({"type": "object", "required": 1}),
+        json!({"type": "object", "required": [1]}),
         json!({"enum": [{"a": 1}]}),
         json!({"const": {"a": 1}}),
         json!({"not": {"required": ["a"]}}),

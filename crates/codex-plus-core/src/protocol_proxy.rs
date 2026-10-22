@@ -4752,6 +4752,19 @@ fn normalize_responses_tool_schemas(tools: &mut [Value]) -> anyhow::Result<()> {
 }
 
 fn normalize_responses_tool_parameters(parameters: &Value) -> anyhow::Result<Value> {
+    if let Some(object) = parameters.as_object()
+        && object.get("type").is_some_and(|value| value == "object")
+        && !SCHEMA_COMBINATOR_KEYS.iter()
+            .chain(["enum", "const", "not", "$ref"].iter())
+            .any(|key| object.contains_key(*key))
+    {
+        if let Some(properties) = object.get("properties") {
+            anyhow::ensure!(properties.is_object(), "工具参数 properties 必须是对象");
+        }
+        schema_required_fields(object.get("required").cloned())?;
+        // 合法对象原样透传，避免补字段、排序或展开引用破坏保留工具的严格 Schema 匹配。
+        return Ok(parameters.clone());
+    }
     normalize_responses_tool_parameters_with_defs(parameters, None, &mut Vec::new())
 }
 
