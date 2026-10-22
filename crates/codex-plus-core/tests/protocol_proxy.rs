@@ -3658,6 +3658,68 @@ async fn model_route_uses_target_responses_provider_without_mutating_request() {
 }
 
 #[tokio::test]
+async fn model_route_replays_chat_reasoning_history_for_responses() {
+    let request = json!({
+        "model": "gpt-5.6-luna",
+        "input": [
+            {"type": "message", "role": "user", "content": "first question"},
+            {
+                "type": "reasoning", "id": "rs_resp_chat_fixture",
+                "summary": [{"type": "summary_text", "text": "Earlier model context."}],
+                "content": null, "encrypted_content": null
+            },
+            {
+                "type": "message", "id": "msg_chat_fixture", "role": "assistant",
+                "content": [{"type": "output_text", "text": "Earlier answer."}]
+            },
+            {
+                "type": "function_call", "id": "fc_inspect", "call_id": "call_inspect",
+                "name": "inspect", "arguments": "{}"
+            },
+            {
+                "type": "function_call_output", "id": "fco_inspect",
+                "call_id": "call_inspect", "output": "fixture result"
+            },
+            {
+                "type": "reasoning", "id": "rs_native_fixture",
+                "summary": [], "encrypted_content": "fixture-native-state"
+            },
+            {"type": "message", "role": "user", "content": "continue with GPT"}
+        ],
+        "reasoning": {"effort": "high"},
+        "tools": [{
+            "type": "function", "name": "inspect",
+            "parameters": {"type": "object"}
+        }],
+        "stream": false
+    });
+    for enabled in [false, true] {
+        let target = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let server = tokio::spawn(capture_json_request_once(target));
+        let mut settings = model_route_settings("gpt-5.6-luna", "", format!("http://{target_addr}/v1"));
+        settings.relay_profiles[0].protocol = RelayProtocol::ChatCompletions;
+        settings.relay_profiles[0].responses_tool_schema_compat = !enabled;
+        settings.relay_profiles[1].responses_tool_schema_compat = enabled;
+        let result = open_responses_proxy_request_with_settings(&request.to_string(), settings).await.unwrap();
+        assert_eq!(result.status_code, 200);
+        let (headers, body) = server.await.unwrap();
+        assert!(headers.starts_with("POST /v1/responses HTTP/1.1"));
+        let mut expected = request.clone();
+        if enabled {
+            expected["input"][1] = json!({
+                "type": "message", "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "Previous model reasoning summary:\nEarlier model context."
+                }]
+            });
+        }
+        assert_eq!(body, expected);
+    }
+}
+
+#[tokio::test]
 async fn model_route_supports_no_auth_target_without_authorization_header() {
     let target = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await

@@ -1,4 +1,6 @@
-use super::{generic_custom_proxy_tool, normalize_responses_item_id, strip_sse_field};
+use super::{
+    generic_custom_proxy_tool, normalize_responses_item_id, responses_reasoning_text, strip_sse_field,
+};
 use anyhow::Context;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -105,6 +107,30 @@ impl ResponsesToolCompat {
 
     fn prepare_history_item(item: &mut Value) -> anyhow::Result<()> {
         match item.get("type").and_then(Value::as_str) {
+            Some("reasoning")
+                if item.get("id").and_then(Value::as_str)
+                    .and_then(|id| id.strip_prefix("rs_resp_"))
+                    .is_some_and(|suffix| !suffix.is_empty())
+                    && !item.get("encrypted_content")
+                        .is_some_and(|value| !value.is_null() && value.as_str() != Some("")) =>
+            {
+                let summary = responses_reasoning_text(item)
+                    .filter(|text| !text.trim().is_empty())
+                    .context("本地 Chat 推理历史缺少可回放文本，无法转换为 Responses 消息")?;
+                // Chat 合成项不是上游加密推理状态；以普通助手上下文保留文本，不伪造可复用状态。
+                *item = json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{
+                        "type": "output_text",
+                        "text": format!("Previous model reasoning summary:\n{summary}")
+                    }]
+                });
+                let _ = crate::diagnostic_log::append_diagnostic_log(
+                    "protocol_proxy.chat_reasoning_history_compat",
+                    json!({ "reason": "synthetic_chat_reasoning_replayed_as_text" }),
+                );
+            }
             Some("custom_tool_call") => {
                 let input = item
                     .get("input")
@@ -422,6 +448,79 @@ mod tests {
             "event: {}\ndata: {value}\n\n",
             value["type"].as_str().unwrap()
         )
+    }
+
+    #[test]
+    fn chat_reasoning_history_replays_after_client_serialization() {
+        let response = crate::protocol_proxy::chat_completion_to_response(json!({
+            "id": "chat_fixture",
+            "choices": [{"message": {
+                "role": "assistant",
+                "reasoning_content": "Earlier model context.",
+                "content": "Earlier answer."
+            }}]
+        })).unwrap();
+        let mut reasoning = response["output"][0].clone();
+        reasoning.as_object_mut().unwrap().remove("reasoning_content");
+        for encrypted in [None, Some(Value::Null), Some(json!(""))] {
+            let mut item = reasoning.clone();
+            item["content"] = Value::Null;
+            if let Some(encrypted) = encrypted {
+                item["encrypted_content"] = encrypted;
+            }
+            let mut request = json!({
+                "input": [item, response["output"][1]],
+                "reasoning": {"effort": "high"}
+            });
+            assert!(ResponsesToolCompat::prepare_request(&mut request).unwrap().is_none());
+            assert_eq!(request["input"][0], json!({
+                "type": "message", "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "Previous model reasoning summary:\nEarlier model context."
+                }]
+            }));
+            assert_eq!(request["input"][1], response["output"][1]);
+            assert_eq!(request["reasoning"]["effort"], "high");
+            let once = request.clone();
+            ResponsesToolCompat::prepare_request(&mut request).unwrap();
+            assert_eq!(request, once);
+        }
+    }
+
+    #[test]
+    fn native_reasoning_and_encrypted_states_remain_unchanged() {
+        let mut request = json!({
+            "input": [
+                {
+                    "type": "reasoning", "id": "rs_native",
+                    "summary": [{"type": "summary_text", "text": "Native summary"}],
+                    "encrypted_content": null
+                },
+                {
+                    "type": "reasoning", "id": "rs_resp_native",
+                    "summary": [], "encrypted_content": "fixture-native-state"
+                },
+                {"type": "reasoning", "id": "rs_resp_", "summary": []},
+                {"type": "compaction", "encrypted_content": "fixture-native-compaction"},
+                {"type": "message", "role": "user", "content": "hello"}
+            ]
+        });
+        let original = request.clone();
+        assert!(ResponsesToolCompat::prepare_request(&mut request).unwrap().is_none());
+        assert_eq!(request, original);
+    }
+
+    #[test]
+    fn chat_reasoning_history_without_text_fails_explicitly() {
+        let mut request = json!({
+            "input": {
+                "type": "reasoning", "id": "rs_resp_empty", "summary": [],
+                "encrypted_content": null
+            }
+        });
+        let error = ResponsesToolCompat::prepare_request(&mut request).unwrap_err();
+        assert!(error.to_string().contains("本地 Chat 推理历史缺少可回放文本"));
     }
 
     #[test]
