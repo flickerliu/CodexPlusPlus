@@ -244,6 +244,8 @@ Codex 用量挂件可在「Codex 增强 → 常用增强 → 挂件与桌宠」�
 
 Responses 供应商可在请求设置中单独开启「Responses 工具 Schema 兼容」（`responsesToolSchemaCompat`），默认关闭，开启后同样需要本地代理。此功能保留 Responses 协议、工具名、namespace 和参数字段，把工具参数顶层的 `oneOf` / `anyOf` / `allOf` 合并为对象 schema。合并会放宽分支之间的互斥等约束，适用于拒绝 `automation_update` 等顶层组合 schema 的网关；顶层 `enum` / `const` / `not`、未解析引用或非对象分支不能安全合并时会明确报错，不会删工具或静默发送空 schema。无自定义头且未启用兼容设置（也无其他代理功能）的 Responses 供应商继续直连。
 
+该开关也兼容拒绝 `tools[].type = "custom"` 的 Responses 上游：代理将自由文本工具包装为带字符串 `input` 参数的标准 Responses `function`，保留原始格式说明，并转换工具选择与历史回放；非流式响应和 SSE 工具事件会还原为 Codex 的 `custom_tool_call`。工具名称、namespace、`call_id` 保持一致，不改为 Chat Completions，也不删除工具。流式工具参数的 JSON 包装完整前不会作为原始文本发送；普通 Responses 事件、推理内容和加密压缩状态不参与这种转换。参数损坏或 SSE 截断会明确报错。
+
 ### 给每个模型设置自己的上下文窗口
 
 在模型列表中使用窗口后缀，例如：

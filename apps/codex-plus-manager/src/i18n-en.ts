@@ -1149,8 +1149,8 @@ export const EN_PLAIN: Record<string, string> = {
   "当前配置需要本地协议代理。保存后将立即重启 Codex，使请求头、兼容设置与路由安全生效。是否继续？":
     "This configuration requires the local protocol proxy. Codex will restart after saving so headers, compatibility settings, and routing take effect safely. Continue?",
   "Responses 工具 Schema 兼容": "Responses tool schema compatibility",
-  "通过本地代理合并工具参数顶层的 oneOf / anyOf / allOf，保留工具名与参数字段，但会放宽分支约束。仅在上游拒绝这些 Schema 时启用；无法安全合并时会明确报错。":
-    "Merge top-level oneOf / anyOf / allOf in tool parameters through the local proxy. Names and fields are preserved, but branch constraints are relaxed. Enable only when upstream rejects these schemas; unsupported merges fail explicitly.",
+  "通过本地代理合并顶层组合 Schema，并将 custom 工具包装为标准 function，再向 Codex 还原原始调用。保持 Responses 协议、工具名与 namespace；Schema 合并会放宽分支约束，仅在上游不兼容时启用。":
+    "Merge top-level schema combinators and wrap custom tools as standard functions, restoring the original calls for Codex. Responses, tool names, and namespaces are preserved. Schema merging relaxes branch constraints; enable only for incompatible upstreams.",
   "首次启用单模型路由需要启动本地协议代理。保存后将立即重启 Codex，使路由安全生效。是否继续？":
     "Enabling per-model routing for the first time requires the local protocol proxy. Codex will restart immediately after saving so routing can take effect safely. Continue?",
   "匹配模型": "Match model",

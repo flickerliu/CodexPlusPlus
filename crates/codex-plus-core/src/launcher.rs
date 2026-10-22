@@ -1934,6 +1934,7 @@ async fn handle_protocol_proxy_connection(
         stream.shutdown().await?;
         return Ok(());
     }
+    let responses_tool_compat = upstream.responses_tool_compat;
     if upstream.is_stream {
         write_http_stream_headers(stream, "200 OK", "text/event-stream; charset=utf-8").await?;
         if upstream.compaction {
@@ -1977,6 +1978,7 @@ async fn handle_protocol_proxy_connection(
             upstream.response,
             upstream.wire_api,
             request_json.as_ref(),
+            responses_tool_compat,
         )
         .await?;
         if let Some(reason) = failure {
@@ -2028,6 +2030,10 @@ async fn handle_protocol_proxy_connection(
         return Ok(());
     }
     if upstream.wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
+        let upstream_body = match responses_tool_compat {
+            Some(context) => context.restore_response_bytes(&upstream_body)?,
+            None => upstream_body.to_vec(),
+        };
         write_http_response(
             stream,
             "200 OK",
@@ -2506,17 +2512,31 @@ async fn forward_protocol_proxy_stream(
     response: reqwest::Response,
     wire_api: crate::protocol_proxy::UpstreamWireApi,
     request: Option<&Value>,
+    responses_tool_compat: Option<crate::protocol_proxy::ResponsesToolCompat>,
 ) -> anyhow::Result<Option<String>> {
     let mut chunks = response.bytes_stream();
     if wire_api == crate::protocol_proxy::UpstreamWireApi::Responses {
         let mut observer = crate::protocol_proxy::NativeResponsesSseObserver::default();
+        let mut converter = responses_tool_compat.map(crate::protocol_proxy::ResponsesToolSseConverter::new);
         while let Some(chunk) = chunks.next().await {
             match chunk {
                 Ok(bytes) => {
-                    stream.write_all(&bytes).await?;
                     observer.push_bytes(&bytes);
+                    let converted = match &mut converter {
+                        Some(converter) => match converter.push_bytes(&bytes) {
+                            Ok(converted) => converted,
+                            Err(error) => return report_responses_tool_compat_failure(stream, error).await,
+                        },
+                        None => bytes.to_vec(),
+                    };
+                    stream.write_all(&converted).await?;
                 }
                 Err(error) => return Ok(Some(error.without_url().to_string())),
+            }
+        }
+        if let Some(converter) = converter {
+            if let Err(error) = converter.finish() {
+                return report_responses_tool_compat_failure(stream, error).await;
             }
         }
         return Ok(observer.finish());
@@ -2554,6 +2574,20 @@ async fn forward_protocol_proxy_stream(
     }
     stream.write_all(&converter.finish()).await?;
     Ok(None)
+}
+
+async fn report_responses_tool_compat_failure(
+    stream: &mut tokio::net::TcpStream,
+    error: anyhow::Error,
+) -> anyhow::Result<Option<String>> {
+    let reason = error.to_string();
+    let event = serde_json::json!({
+        "type": "error",
+        "code": "responses_tool_compat_error",
+        "message": reason,
+    });
+    stream.write_all(format!("event: error\ndata: {event}\n\n").as_bytes()).await?;
+    Ok(Some(reason))
 }
 
 fn log_helper_response(
@@ -5001,6 +5035,15 @@ mod proxy_stream_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn forward_fixture(body: &str, truncated: bool, wire: UpstreamWireApi) -> (Option<String>, String) {
+        forward_fixture_with_tools(body, truncated, wire, None).await
+    }
+
+    async fn forward_fixture_with_tools(
+        body: &str,
+        truncated: bool,
+        wire: UpstreamWireApi,
+        tool_compat: Option<crate::protocol_proxy::ResponsesToolCompat>,
+    ) -> (Option<String>, String) {
         let upstream = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = upstream.local_addr().unwrap();
         let body = body.to_owned();
@@ -5023,7 +5066,7 @@ mod proxy_stream_tests {
         let mut reader = tokio::net::TcpStream::connect(downstream.local_addr().unwrap()).await.unwrap();
         let (mut writer, _) = downstream.accept().await.unwrap();
         let forwarded = tokio::spawn(async move {
-            let result = forward_protocol_proxy_stream(&mut writer, response, wire, None).await.unwrap();
+            let result = forward_protocol_proxy_stream(&mut writer, response, wire, None, tool_compat).await.unwrap();
             writer.shutdown().await.unwrap();
             result
         });
@@ -5032,6 +5075,50 @@ mod proxy_stream_tests {
         let result = forwarded.await.unwrap();
         upstream_task.await.unwrap();
         (result, String::from_utf8(bytes).unwrap())
+    }
+
+    #[tokio::test]
+    async fn native_responses_custom_tools_are_restored_in_the_actual_stream_forwarder() {
+        let mut request = serde_json::json!({"tools":[{"type":"custom","name":"fixture_custom"}]});
+        let context = crate::protocol_proxy::ResponsesToolCompat::prepare_request(&mut request).unwrap();
+        let body = concat!(
+            "event: response.output_item.added\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"fixture_custom\",\"arguments\":\"\"}}\n\n",
+            "event: response.function_call_arguments.delta\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"input\\\":\\\"hello\\\"}\"}\n\n",
+            "event: response.function_call_arguments.done\n",
+            "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"arguments\":\"{\\\"input\\\":\\\"hello\\\"}\"}\n\n",
+            "event: response.output_item.done\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"fixture_custom\",\"arguments\":\"{\\\"input\\\":\\\"hello\\\"}\"}}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"output\":[]}}\n\n",
+        );
+        let (failure, output) = forward_fixture_with_tools(body, false, UpstreamWireApi::Responses, context).await;
+        assert_eq!(failure, None);
+        assert!(output.contains("\"type\":\"custom_tool_call\""));
+        assert!(output.contains("\"input\":\"hello\""));
+        assert!(output.contains("\"call_id\":\"call_1\""));
+        assert!(output.contains("\"item_id\":\"ctc_1\""));
+        assert!(!output.contains("function_call_arguments"));
+        assert!(output.contains("response.completed"));
+    }
+
+    #[tokio::test]
+    async fn responses_custom_conversion_errors_are_visible_to_the_client() {
+        for body in [
+            concat!(
+                "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"name\":\"fixture_custom\",\"arguments\":\"\"}}\n\n",
+                "data: {\"type\":\"response.function_call_arguments.done\",\"item_id\":\"fc_1\",\"arguments\":\"not json\"}\n\n",
+            ),
+            "event: response.completed\ndata: {",
+        ] {
+            let mut request = serde_json::json!({"tools":[{"type":"custom","name":"fixture_custom"}]});
+            let context = crate::protocol_proxy::ResponsesToolCompat::prepare_request(&mut request).unwrap();
+            let (failure, output) = forward_fixture_with_tools(body, false, UpstreamWireApi::Responses, context).await;
+            assert!(failure.is_some());
+            assert!(output.contains("event: error"));
+            assert!(output.contains("responses_tool_compat_error"));
+        }
     }
 
     #[tokio::test]

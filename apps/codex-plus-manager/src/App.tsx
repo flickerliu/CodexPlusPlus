@@ -8952,7 +8952,7 @@ function RelayProfileEditor({
                 />
                 <span>
                   <strong>{t("Responses 工具 Schema 兼容")}</strong>
-                  <small>{t("通过本地代理合并工具参数顶层的 oneOf / anyOf / allOf，保留工具名与参数字段，但会放宽分支约束。仅在上游拒绝这些 Schema 时启用；无法安全合并时会明确报错。")}</small>
+                  <small>{t("通过本地代理合并顶层组合 Schema，并将 custom 工具包装为标准 function，再向 Codex 还原原始调用。保持 Responses 协议、工具名与 namespace；Schema 合并会放宽分支约束，仅在上游不兼容时启用。")}</small>
                 </span>
                 <ToggleVisual />
               </label>

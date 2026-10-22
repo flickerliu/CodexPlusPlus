@@ -14,6 +14,9 @@ use serde_json::{Map, Value, json};
 use crate::relay_rotation::{RotationContext, RotationEvent};
 use crate::settings::{RelayProtocol, SettingsStore};
 
+mod responses_tool_compat;
+pub use responses_tool_compat::{ResponsesToolCompat, ResponsesToolSseConverter};
+
 pub const DEFAULT_PROTOCOL_PROXY_PORT: u16 = 57321;
 
 /// 工具调用上需要跨 turn 原样带回的供应商附带数据，按 `call_id` 索引。
@@ -565,6 +568,7 @@ pub struct UpstreamProxyResponse {
     /// 仅标记 Chat Completions 的合成摘要兼容路径；原生 Responses 保持透传。
     /// 响应必须由代理重组为单个 `compaction` 输出项。
     pub compaction: bool,
+    pub responses_tool_compat: Option<ResponsesToolCompat>,
     pub response: reqwest::Response,
     pub(crate) _channel_permit: Option<crate::channel_protection::ChannelPermit>,
 }
@@ -1489,7 +1493,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
         let channel_permit =
             crate::channel_protection::acquire(&channel_key, &relay).await;
         let model_override = aggregate_upstream_model_override(&settings, &relay);
-        let (endpoint, upstream_body, wire_api, compaction) = upstream_request_parts(
+        let (endpoint, upstream_body, wire_api, compaction, responses_tool_compat) = upstream_request_parts(
             &relay,
             request_json.clone(),
             request_path,
@@ -1506,6 +1510,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 "relayName": relay.name,
                 "endpoint": endpoint,
                 "wireApi": wire_api,
+                "responsesToolCompat": responses_tool_compat.is_some(),
                 "stream": is_stream,
                 "attempt": attempt + 1,
                 "candidateCount": relay_count,
@@ -1627,6 +1632,7 @@ async fn open_responses_proxy_request_with_settings_and_user_agent(
                 content_type,
                 wire_api,
                 compaction: is_compaction_request,
+                responses_tool_compat,
                 response: upstream,
                 _channel_permit: Some(channel_permit),
             });
@@ -1751,6 +1757,7 @@ pub async fn open_models_proxy_request(
         content_type,
         wire_api: UpstreamWireApi::Responses,
         compaction: false,
+        responses_tool_compat: None,
         response: upstream,
         _channel_permit: None,
     })
@@ -1802,6 +1809,7 @@ pub async fn open_audio_transcriptions_proxy_request(
         content_type,
         wire_api: UpstreamWireApi::AudioTranscriptions,
         compaction: false,
+        responses_tool_compat: None,
         response: upstream,
         _channel_permit: None,
     })
@@ -1935,6 +1943,7 @@ async fn open_image_proxy_request(
         content_type,
         wire_api,
         compaction: false,
+        responses_tool_compat: None,
         response: upstream,
         _channel_permit: None,
     })
@@ -2027,6 +2036,7 @@ pub async fn open_chat_completions_proxy_request(
             content_type,
             wire_api: UpstreamWireApi::ChatCompletions,
             compaction: false,
+            responses_tool_compat: None,
             response: upstream,
             _channel_permit: Some(channel_permit),
         });
@@ -2038,7 +2048,7 @@ async fn upstream_request_parts(
     mut request_json: Value,
     request_path: &str,
     model_override: Option<&str>,
-) -> anyhow::Result<(String, Value, UpstreamWireApi, bool)> {
+) -> anyhow::Result<(String, Value, UpstreamWireApi, bool, Option<ResponsesToolCompat>)> {
     let compact = is_responses_compact_proxy_path(request_path)
         || request_has_compaction_trigger(&request_json);
     let is_v2_compaction = compact && request_has_compaction_trigger(&request_json);
@@ -2060,14 +2070,16 @@ async fn upstream_request_parts(
             relay.standard_openai_protocol,
         )?,
     };
+    let mut responses_tool_compat = None;
     if relay.protocol == RelayProtocol::Responses {
-        normalize_responses_item_ids(&mut body);
         if relay.responses_tool_schema_compat {
+            responses_tool_compat = ResponsesToolCompat::prepare_request(&mut body)?;
             if let Some(tools) = body.get_mut("tools") {
                 let tools = tools.as_array_mut().context("Responses tools 必须是数组")?;
                 normalize_responses_tool_schemas(tools)?;
             }
         }
+        normalize_responses_item_ids(&mut body);
     }
 
     // Image handling (per-model): send-as-is / strip / VLM analysis
@@ -2141,6 +2153,7 @@ async fn upstream_request_parts(
         body,
         wire_api,
         synthetic_compaction,
+        responses_tool_compat,
     ))
 }
 
@@ -2241,6 +2254,7 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
     let upstream_content_type = upstream.content_type.clone();
     let is_stream = upstream.is_stream;
     let wire_api = upstream.wire_api;
+    let responses_tool_compat = upstream.responses_tool_compat;
     let upstream_body = upstream.response.bytes().await?;
 
     if !(200..300).contains(&status_code) {
@@ -2280,6 +2294,16 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
     }
 
     if wire_api == UpstreamWireApi::Responses {
+        let body = match responses_tool_compat {
+            Some(context) if is_stream => {
+                let mut converter = ResponsesToolSseConverter::new(context);
+                let converted = converter.push_bytes(&upstream_body)?;
+                converter.finish()?;
+                converted
+            }
+            Some(context) => context.restore_response_bytes(&upstream_body)?,
+            None => upstream_body.to_vec(),
+        };
         return Ok(ProxyHttpResponse {
             status: "200 OK".to_string(),
             content_type: if upstream_content_type.is_empty() {
@@ -2287,7 +2311,7 @@ pub async fn handle_responses_proxy_request(body: &str) -> anyhow::Result<ProxyH
             } else {
                 upstream_content_type
             },
-            body: upstream_body.to_vec(),
+            body,
         });
     }
 

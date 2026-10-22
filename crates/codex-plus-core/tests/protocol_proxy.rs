@@ -4432,7 +4432,9 @@ async fn responses_schema_compat_preserves_namespaces_headers_and_streams() {
                         {"properties": {"d": {"type": "number"}}}
                     ]
                 }
-            }
+            },
+            {"type": "custom", "name": "apply_patch", "description": "fixture patch",
+             "format": {"type": "text"}}
         ]
     });
     let sse = "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"name\":\"automation_update\",\"namespace\":\"automations\",\"call_id\":\"call_1\",\"arguments\":\"{}\"}}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_compat\"}}\n\n";
@@ -4453,6 +4455,7 @@ async fn responses_schema_compat_preserves_namespaces_headers_and_streams() {
         ];
         let result = open_responses_proxy_request_with_settings(&request.to_string(), settings).await.unwrap();
         assert_eq!(result.status_code, 200);
+        assert_eq!(result.responses_tool_compat.is_some(), enabled);
         assert!(result.is_stream);
         assert_eq!(result.response.text().await.unwrap(), sse);
         let (headers, body) = server.await.unwrap();
@@ -4465,7 +4468,10 @@ async fn responses_schema_compat_preserves_namespaces_headers_and_streams() {
             assert_eq!(body["tools"], request["tools"]);
             continue;
         }
-        assert_eq!(body["tools"].as_array().unwrap().len(), 3);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 4);
+        assert_eq!(body["tools"][3]["type"], "function");
+        assert_eq!(body["tools"][3]["name"], "apply_patch");
+        assert_eq!(body["tools"][3]["parameters"]["properties"]["input"]["type"], "string");
         assert_eq!(body["tools"][0], request["tools"][0]);
         let namespace = &body["tools"][1];
         assert_eq!(namespace["name"], "automations");
